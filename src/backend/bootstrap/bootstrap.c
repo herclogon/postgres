@@ -4,7 +4,7 @@
  *	  routines to support running postgres in 'bootstrap' mode
  *	bootstrap mode is used to create the initial template database
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,20 +18,25 @@
 #include <signal.h>
 
 #include "access/htup_details.h"
+#include "access/xact.h"
+#include "access/xlog_internal.h"
 #include "bootstrap/bootstrap.h"
 #include "catalog/index.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "common/link-canary.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "pg_getopt.h"
+#include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/startup.h"
 #include "postmaster/walwriter.h"
 #include "replication/walreceiver.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/condition_variable.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
@@ -43,10 +48,11 @@
 #include "utils/relmapper.h"
 #include "utils/tqual.h"
 
-uint32		bootstrap_data_checksum_version = 0;		/* No checksum */
+uint32		bootstrap_data_checksum_version = 0;	/* No checksum */
 
 
-#define ALLOC(t, c)		((t *) calloc((unsigned)(c), sizeof(t)))
+#define ALLOC(t, c) \
+	((t *) MemoryContextAllocZero(TopMemoryContext, (unsigned)(c) * sizeof(t)))
 
 static void CheckerModeMain(void);
 static void BootstrapModeMain(void);
@@ -159,7 +165,7 @@ static struct typmap *Ap = NULL;
 static Datum values[MAXATTR];	/* current row's attribute values */
 static bool Nulls[MAXATTR];
 
-static MemoryContext nogc = NULL;		/* special no-gc mem context */
+static MemoryContext nogc = NULL;	/* special no-gc mem context */
 
 /*
  *	At bootstrap time, we first declare all the indices to be built, and
@@ -204,7 +210,7 @@ AuxiliaryProcessMain(int argc, char *argv[])
 	 * process command arguments
 	 */
 
-	/* Set defaults, to be overriden by explicit options below */
+	/* Set defaults, to be overridden by explicit options below */
 	if (!IsUnderPostmaster)
 		InitializeGUCOptions();
 
@@ -218,7 +224,7 @@ AuxiliaryProcessMain(int argc, char *argv[])
 	/* If no -x argument, we are a CheckerProcess */
 	MyAuxProcType = CheckerProcess;
 
-	while ((flag = getopt(argc, argv, "B:c:d:D:Fkr:x:-:")) != -1)
+	while ((flag = getopt(argc, argv, "B:c:d:D:Fkr:x:X:-:")) != -1)
 	{
 		switch (flag)
 		{
@@ -226,7 +232,7 @@ AuxiliaryProcessMain(int argc, char *argv[])
 				SetConfigOption("shared_buffers", optarg, PGC_POSTMASTER, PGC_S_ARGV);
 				break;
 			case 'D':
-				userDoption = strdup(optarg);
+				userDoption = pstrdup(optarg);
 				break;
 			case 'd':
 				{
@@ -252,6 +258,18 @@ AuxiliaryProcessMain(int argc, char *argv[])
 				break;
 			case 'x':
 				MyAuxProcType = atoi(optarg);
+				break;
+			case 'X':
+				{
+					int			WalSegSz = strtoul(optarg, NULL, 0);
+
+					if (!IsValidWalSegSize(WalSegSz))
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("-X requires a power of two value between 1 MB and 1 GB")));
+					SetConfigOption("wal_segment_size", optarg, PGC_INTERNAL,
+									PGC_S_OVERRIDE);
+				}
 				break;
 			case 'c':
 			case '-':
@@ -304,19 +322,19 @@ AuxiliaryProcessMain(int argc, char *argv[])
 		switch (MyAuxProcType)
 		{
 			case StartupProcess:
-				statmsg = "startup process";
+				statmsg = pgstat_get_backend_desc(B_STARTUP);
 				break;
 			case BgWriterProcess:
-				statmsg = "writer process";
+				statmsg = pgstat_get_backend_desc(B_BG_WRITER);
 				break;
 			case CheckpointerProcess:
-				statmsg = "checkpointer process";
+				statmsg = pgstat_get_backend_desc(B_CHECKPOINTER);
 				break;
 			case WalWriterProcess:
-				statmsg = "wal writer process";
+				statmsg = pgstat_get_backend_desc(B_WAL_WRITER);
 				break;
 			case WalReceiverProcess:
-				statmsg = "wal receiver process";
+				statmsg = pgstat_get_backend_desc(B_WAL_RECEIVER);
 				break;
 			default:
 				statmsg = "??? process";
@@ -332,13 +350,15 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			proc_exit(1);
 	}
 
-	/* Validate we have been given a reasonable-looking DataDir */
-	Assert(DataDir);
-	ValidatePgVersion(DataDir);
-
-	/* Change into DataDir (if under postmaster, should be done already) */
+	/*
+	 * Validate we have been given a reasonable-looking DataDir and change
+	 * into it (if under postmaster, should be done already).
+	 */
 	if (!IsUnderPostmaster)
+	{
+		checkDataDir();
 		ChangeToDataDir();
+	}
 
 	/* If standalone, create lockfile for data directory */
 	if (!IsUnderPostmaster)
@@ -383,6 +403,17 @@ AuxiliaryProcessMain(int argc, char *argv[])
 
 		/* finish setting up bufmgr.c */
 		InitBufferPoolBackend();
+
+		/*
+		 * Auxiliary processes don't run transactions, but they may need a
+		 * resource owner anyway to manage buffer pins acquired outside
+		 * transactions (and, perhaps, other things in future).
+		 */
+		CreateAuxProcessResourceOwner();
+
+		/* Initialize backend status information */
+		pgstat_initialize();
+		pgstat_bestart();
 
 		/* register a before-shutdown callback for LWLock cleanup */
 		before_shmem_exit(ShutdownAuxiliaryProcess, 0);
@@ -473,11 +504,18 @@ BootstrapModeMain(void)
 	Assert(IsBootstrapProcessingMode());
 
 	/*
+	 * To ensure that src/common/link-canary.c is linked into the backend, we
+	 * must call it from somewhere.  Here is as good as anywhere.
+	 */
+	if (pg_link_canary_is_frontend())
+		elog(ERROR, "backend is incorrectly linked to frontend functions");
+
+	/*
 	 * Do backend-like initialization for bootstrap mode
 	 */
 	InitProcess();
 
-	InitPostgres(NULL, InvalidOid, NULL, InvalidOid, NULL);
+	InitPostgres(NULL, InvalidOid, NULL, InvalidOid, NULL, false);
 
 	/* Initialize stuff for bootstrap-file processing */
 	for (i = 0; i < MAXATTR; i++)
@@ -489,7 +527,9 @@ BootstrapModeMain(void)
 	/*
 	 * Process bootstrap input.
 	 */
+	StartTransactionCommand();
 	boot_yyparse();
+	CommitTransactionCommand();
 
 	/*
 	 * We should now know about all mapped relations, so it's okay to write
@@ -534,6 +574,8 @@ static void
 ShutdownAuxiliaryProcess(int code, Datum arg)
 {
 	LWLockReleaseAll();
+	ConditionVariableCancelSleep();
+	pgstat_report_wait_end();
 }
 
 /* ----------------------------------------------------------------
@@ -591,13 +633,13 @@ boot_openrel(char *relname)
 		 relname, (int) ATTRIBUTE_FIXED_PART_SIZE);
 
 	boot_reldesc = heap_openrv(makeRangeVar(NULL, relname, -1), NoLock);
-	numattr = boot_reldesc->rd_rel->relnatts;
+	numattr = RelationGetNumberOfAttributes(boot_reldesc);
 	for (i = 0; i < numattr; i++)
 	{
 		if (attrtypes[i] == NULL)
 			attrtypes[i] = AllocateAttribute();
 		memmove((char *) attrtypes[i],
-				(char *) boot_reldesc->rd_att->attrs[i],
+				(char *) TupleDescAttr(boot_reldesc->rd_att, i),
 				ATTRIBUTE_FIXED_PART_SIZE);
 
 		{
@@ -668,7 +710,7 @@ DefineAttr(char *name, char *type, int attnum, int nullness)
 
 	namestrcpy(&attrtypes[attnum]->attname, name);
 	elog(DEBUG4, "column %s %s", NameStr(attrtypes[attnum]->attname), type);
-	attrtypes[attnum]->attnum = attnum + 1;		/* fillatt */
+	attrtypes[attnum]->attnum = attnum + 1; /* fillatt */
 
 	typeoid = gettype(type);
 
@@ -804,7 +846,7 @@ InsertOneValue(char *value, int i)
 
 	elog(DEBUG4, "inserting column %d value \"%s\"", i, value);
 
-	typoid = boot_reldesc->rd_att->attrs[i]->atttypid;
+	typoid = TupleDescAttr(boot_reldesc->rd_att, i)->atttypid;
 
 	boot_get_type_io_data(typoid,
 						  &typlen, &typbyval, &typalign,
@@ -831,6 +873,11 @@ InsertOneNull(int i)
 {
 	elog(DEBUG4, "inserting column %d NULL", i);
 	Assert(i >= 0 && i < MAXATTR);
+	if (TupleDescAttr(boot_reldesc->rd_att, i)->attnotnull)
+		elog(ERROR,
+			 "NULL value specified for not-null column \"%s\" of relation \"%s\"",
+			 NameStr(TupleDescAttr(boot_reldesc->rd_att, i)->attname),
+			 RelationGetRelationName(boot_reldesc));
 	values[i] = PointerGetDatum(NULL);
 	Nulls[i] = true;
 }
@@ -1000,44 +1047,9 @@ boot_get_type_io_data(Oid typid,
 static Form_pg_attribute
 AllocateAttribute(void)
 {
-	Form_pg_attribute attribute = (Form_pg_attribute) malloc(ATTRIBUTE_FIXED_PART_SIZE);
-
-	if (!PointerIsValid(attribute))
-		elog(FATAL, "out of memory");
-	MemSet(attribute, 0, ATTRIBUTE_FIXED_PART_SIZE);
-
-	return attribute;
+	return (Form_pg_attribute)
+		MemoryContextAllocZero(TopMemoryContext, ATTRIBUTE_FIXED_PART_SIZE);
 }
-
-/*
- *		MapArrayTypeName
- *
- * Given a type name, produce the corresponding array type name by prepending
- * '_' and truncating as needed to fit in NAMEDATALEN-1 bytes.  This is only
- * used in bootstrap mode, so we can get away with assuming that the input is
- * ASCII and we don't need multibyte-aware truncation.
- *
- * The given string normally ends with '[]' or '[digits]'; we discard that.
- *
- * The result is a palloc'd string.
- */
-char *
-MapArrayTypeName(const char *s)
-{
-	int			i,
-				j;
-	char		newStr[NAMEDATALEN];
-
-	newStr[0] = '_';
-	j = 1;
-	for (i = 0; i < NAMEDATALEN - 2 && s[i] != '['; i++, j++)
-		newStr[j] = s[i];
-
-	newStr[j] = '\0';
-
-	return pstrdup(newStr);
-}
-
 
 /*
  *	index_register() -- record an index that has been set up for building
@@ -1067,9 +1079,7 @@ index_register(Oid heap,
 	if (nogc == NULL)
 		nogc = AllocSetContextCreate(NULL,
 									 "BootstrapNoGC",
-									 ALLOCSET_DEFAULT_MINSIZE,
-									 ALLOCSET_DEFAULT_INITSIZE,
-									 ALLOCSET_DEFAULT_MAXSIZE);
+									 ALLOCSET_DEFAULT_SIZES);
 
 	oldcxt = MemoryContextSwitchTo(nogc);
 
@@ -1080,13 +1090,13 @@ index_register(Oid heap,
 
 	memcpy(newind->il_info, indexInfo, sizeof(IndexInfo));
 	/* expressions will likely be null, but may as well copy it */
-	newind->il_info->ii_Expressions = (List *)
+	newind->il_info->ii_Expressions =
 		copyObject(indexInfo->ii_Expressions);
 	newind->il_info->ii_ExpressionsState = NIL;
 	/* predicate will likely be null, but may as well copy it */
-	newind->il_info->ii_Predicate = (List *)
+	newind->il_info->ii_Predicate =
 		copyObject(indexInfo->ii_Predicate);
-	newind->il_info->ii_PredicateState = NIL;
+	newind->il_info->ii_PredicateState = NULL;
 	/* no exclusion constraints at bootstrap time, so no need to copy */
 	Assert(indexInfo->ii_ExclusionOps == NULL);
 	Assert(indexInfo->ii_ExclusionProcs == NULL);
@@ -1114,7 +1124,7 @@ build_indices(void)
 		heap = heap_open(ILHead->il_heap, NoLock);
 		ind = index_open(ILHead->il_ind, NoLock);
 
-		index_build(heap, ind, ILHead->il_info, false, false);
+		index_build(heap, ind, ILHead->il_info, false, false, false);
 
 		index_close(ind, NoLock);
 		heap_close(heap, NoLock);

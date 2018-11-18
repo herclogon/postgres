@@ -3,12 +3,14 @@
  *
  *	database server functions
  *
- *	Copyright (c) 2010-2015, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2018, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/server.c
  */
 
 #include "postgres_fe.h"
 
+#include "fe_utils/connect.h"
+#include "fe_utils/string_utils.h"
 #include "pg_upgrade.h"
 
 
@@ -29,15 +31,17 @@ connectToServer(ClusterInfo *cluster, const char *db_name)
 
 	if (conn == NULL || PQstatus(conn) != CONNECTION_OK)
 	{
-		pg_log(PG_REPORT, "connection to database failed: %s\n",
+		pg_log(PG_REPORT, "connection to database failed: %s",
 			   PQerrorMessage(conn));
 
 		if (conn)
 			PQfinish(conn);
 
-		printf("Failure, exiting\n");
+		printf(_("Failure, exiting\n"));
 		exit(1);
 	}
+
+	PQclear(executeQueryOrDie(conn, ALWAYS_SECURE_SEARCH_PATH_SQL));
 
 	return conn;
 }
@@ -51,18 +55,25 @@ connectToServer(ClusterInfo *cluster, const char *db_name)
 static PGconn *
 get_db_conn(ClusterInfo *cluster, const char *db_name)
 {
-	char		conn_opts[2 * NAMEDATALEN + MAXPGPATH + 100];
+	PQExpBufferData conn_opts;
+	PGconn	   *conn;
 
+	/* Build connection string with proper quoting */
+	initPQExpBuffer(&conn_opts);
+	appendPQExpBufferStr(&conn_opts, "dbname=");
+	appendConnStrVal(&conn_opts, db_name);
+	appendPQExpBufferStr(&conn_opts, " user=");
+	appendConnStrVal(&conn_opts, os_info.user);
+	appendPQExpBuffer(&conn_opts, " port=%d", cluster->port);
 	if (cluster->sockdir)
-		snprintf(conn_opts, sizeof(conn_opts),
-				 "dbname = '%s' user = '%s' host = '%s' port = %d",
-				 db_name, os_info.user, cluster->sockdir, cluster->port);
-	else
-		snprintf(conn_opts, sizeof(conn_opts),
-				 "dbname = '%s' user = '%s' port = %d",
-				 db_name, os_info.user, cluster->port);
+	{
+		appendPQExpBufferStr(&conn_opts, " host=");
+		appendConnStrVal(&conn_opts, cluster->sockdir);
+	}
 
-	return PQconnectdb(conn_opts);
+	conn = PQconnectdb(conn_opts.data);
+	termPQExpBuffer(&conn_opts);
+	return conn;
 }
 
 
@@ -74,23 +85,28 @@ get_db_conn(ClusterInfo *cluster, const char *db_name)
  * sets, but the utilities we need aren't very consistent about the treatment
  * of database name options, so we leave that out.
  *
- * Note result is in static storage, so use it right away.
+ * Result is valid until the next call to this function.
  */
 char *
 cluster_conn_opts(ClusterInfo *cluster)
 {
-	static char conn_opts[MAXPGPATH + NAMEDATALEN + 100];
+	static PQExpBuffer buf;
+
+	if (buf == NULL)
+		buf = createPQExpBuffer();
+	else
+		resetPQExpBuffer(buf);
 
 	if (cluster->sockdir)
-		snprintf(conn_opts, sizeof(conn_opts),
-				 "--host \"%s\" --port %d --username \"%s\"",
-				 cluster->sockdir, cluster->port, os_info.user);
-	else
-		snprintf(conn_opts, sizeof(conn_opts),
-				 "--port %d --username \"%s\"",
-				 cluster->port, os_info.user);
+	{
+		appendPQExpBufferStr(buf, "--host ");
+		appendShellString(buf, cluster->sockdir);
+		appendPQExpBufferChar(buf, ' ');
+	}
+	appendPQExpBuffer(buf, "--port %d --username ", cluster->port);
+	appendShellString(buf, os_info.user);
 
-	return conn_opts;
+	return buf->data;
 }
 
 
@@ -119,11 +135,11 @@ executeQueryOrDie(PGconn *conn, const char *fmt,...)
 
 	if ((status != PGRES_TUPLES_OK) && (status != PGRES_COMMAND_OK))
 	{
-		pg_log(PG_REPORT, "SQL command failed\n%s\n%s\n", query,
+		pg_log(PG_REPORT, "SQL command failed\n%s\n%s", query,
 			   PQerrorMessage(conn));
 		PQclear(result);
 		PQfinish(conn);
-		printf("Failure, exiting\n");
+		printf(_("Failure, exiting\n"));
 		exit(1);
 	}
 	else
@@ -143,8 +159,8 @@ get_major_server_version(ClusterInfo *cluster)
 {
 	FILE	   *version_fd;
 	char		ver_filename[MAXPGPATH];
-	int			integer_version = 0;
-	int			fractional_version = 0;
+	int			v1 = 0,
+				v2 = 0;
 
 	snprintf(ver_filename, sizeof(ver_filename), "%s/PG_VERSION",
 			 cluster->pgdata);
@@ -152,13 +168,21 @@ get_major_server_version(ClusterInfo *cluster)
 		pg_fatal("could not open version file: %s\n", ver_filename);
 
 	if (fscanf(version_fd, "%63s", cluster->major_version_str) == 0 ||
-		sscanf(cluster->major_version_str, "%d.%d", &integer_version,
-			   &fractional_version) != 2)
-		pg_fatal("could not get version from %s\n", cluster->pgdata);
+		sscanf(cluster->major_version_str, "%d.%d", &v1, &v2) < 1)
+		pg_fatal("could not parse PG_VERSION file from %s\n", cluster->pgdata);
 
 	fclose(version_fd);
 
-	return (100 * integer_version + fractional_version) * 100;
+	if (v1 < 10)
+	{
+		/* old style, e.g. 9.6.1 */
+		return v1 * 10000 + v2 * 100;
+	}
+	else
+	{
+		/* new style, e.g. 10.1 */
+		return v1 * 10000;
+	}
 }
 
 
@@ -170,13 +194,14 @@ stop_postmaster_atexit(void)
 
 
 bool
-start_postmaster(ClusterInfo *cluster, bool throw_error)
+start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 {
 	char		cmd[MAXPGPATH * 4 + 1000];
 	PGconn	   *conn;
-	bool		exit_hook_registered = false;
 	bool		pg_ctl_return = false;
 	char		socket_string[MAXPGPATH + 200];
+
+	static bool exit_hook_registered = false;
 
 	if (!exit_hook_registered)
 	{
@@ -217,13 +242,13 @@ start_postmaster(ClusterInfo *cluster, bool throw_error)
 	 * win on ext4.
 	 */
 	snprintf(cmd, sizeof(cmd),
-		  "\"%s/pg_ctl\" -w -l \"%s\" -D \"%s\" -o \"-p %d%s%s %s%s\" start",
-		  cluster->bindir, SERVER_LOG_FILE, cluster->pgconfig, cluster->port,
+			 "\"%s/pg_ctl\" -w -l \"%s\" -D \"%s\" -o \"-p %d%s%s %s%s\" start",
+			 cluster->bindir, SERVER_LOG_FILE, cluster->pgconfig, cluster->port,
 			 (cluster->controldata.cat_ver >=
 			  BINARY_UPGRADE_SERVER_FLAG_CAT_VER) ? " -b" :
 			 " -c autovacuum=off -c autovacuum_freeze_max_age=2000000000",
 			 (cluster == &new_cluster) ?
-	  " -c synchronous_commit=off -c fsync=off -c full_page_writes=off" : "",
+			 " -c synchronous_commit=off -c fsync=off -c full_page_writes=off" : "",
 			 cluster->pgopts ? cluster->pgopts : "", socket_string);
 
 	/*
@@ -235,11 +260,11 @@ start_postmaster(ClusterInfo *cluster, bool throw_error)
 							  (strcmp(SERVER_LOG_FILE,
 									  SERVER_START_LOG_FILE) != 0) ?
 							  SERVER_LOG_FILE : NULL,
-							  false,
+							  report_and_exit_on_error, false,
 							  "%s", cmd);
 
 	/* Did it fail and we are just testing if the server could be started? */
-	if (!pg_ctl_return && !throw_error)
+	if (!pg_ctl_return && !report_and_exit_on_error)
 		return false;
 
 	/*
@@ -267,31 +292,40 @@ start_postmaster(ClusterInfo *cluster, bool throw_error)
 	if ((conn = get_db_conn(cluster, "template1")) == NULL ||
 		PQstatus(conn) != CONNECTION_OK)
 	{
-		pg_log(PG_REPORT, "\nconnection to database failed: %s\n",
+		pg_log(PG_REPORT, "\nconnection to database failed: %s",
 			   PQerrorMessage(conn));
 		if (conn)
 			PQfinish(conn);
-		pg_fatal("could not connect to %s postmaster started with the command:\n"
-				 "%s\n",
-				 CLUSTER_NAME(cluster), cmd);
+		if (cluster == &old_cluster)
+			pg_fatal("could not connect to source postmaster started with the command:\n"
+					 "%s\n",
+					 cmd);
+		else
+			pg_fatal("could not connect to target postmaster started with the command:\n"
+					 "%s\n",
+					 cmd);
 	}
 	PQfinish(conn);
 
 	/*
-	 * If pg_ctl failed, and the connection didn't fail, and throw_error is
-	 * enabled, fail now.  This could happen if the server was already
-	 * running.
+	 * If pg_ctl failed, and the connection didn't fail, and
+	 * report_and_exit_on_error is enabled, fail now.  This could happen if
+	 * the server was already running.
 	 */
 	if (!pg_ctl_return)
-		pg_fatal("pg_ctl failed to start the %s server, or connection failed\n",
-				 CLUSTER_NAME(cluster));
+	{
+		if (cluster == &old_cluster)
+			pg_fatal("pg_ctl failed to start the source server, or connection failed\n");
+		else
+			pg_fatal("pg_ctl failed to start the target server, or connection failed\n");
+	}
 
 	return true;
 }
 
 
 void
-stop_postmaster(bool fast)
+stop_postmaster(bool in_atexit)
 {
 	ClusterInfo *cluster;
 
@@ -302,11 +336,11 @@ stop_postmaster(bool fast)
 	else
 		return;					/* no cluster running */
 
-	exec_prog(SERVER_STOP_LOG_FILE, NULL, !fast,
+	exec_prog(SERVER_STOP_LOG_FILE, NULL, !in_atexit, !in_atexit,
 			  "\"%s/pg_ctl\" -w -D \"%s\" -o \"%s\" %s stop",
 			  cluster->bindir, cluster->pgconfig,
 			  cluster->pgopts ? cluster->pgopts : "",
-			  fast ? "-m fast" : "");
+			  in_atexit ? "-m fast" : "-m smart");
 
 	os_info.running_cluster = NULL;
 }

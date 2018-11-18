@@ -2,7 +2,7 @@
  * dbsize.c
  *		Database object size functions, and related inquiries
  *
- * Copyright (c) 2002-2015, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2018, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/adt/dbsize.c
@@ -11,13 +11,13 @@
 
 #include "postgres.h"
 
-#include <sys/types.h>
 #include <sys/stat.h>
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/dbcommands.h"
 #include "commands/tablespace.h"
@@ -31,6 +31,8 @@
 #include "utils/relmapper.h"
 #include "utils/syscache.h"
 
+/* Divide by two and round towards positive infinity. */
+#define half_rounded(x)   (((x) + ((x) < 0 ? 0 : 1)) / 2)
 
 /* Return physical size of directory contents, or 0 if dir doesn't exist */
 static int64
@@ -39,7 +41,7 @@ db_dir_size(const char *path)
 	int64		dirsize = 0;
 	struct dirent *direntry;
 	DIR		   *dirdesc;
-	char		filename[MAXPGPATH];
+	char		filename[MAXPGPATH * 2];
 
 	dirdesc = AllocateDir(path);
 
@@ -56,7 +58,7 @@ db_dir_size(const char *path)
 			strcmp(direntry->d_name, "..") == 0)
 			continue;
 
-		snprintf(filename, MAXPGPATH, "%s/%s", path, direntry->d_name);
+		snprintf(filename, sizeof(filename), "%s/%s", path, direntry->d_name);
 
 		if (stat(filename, &fst) < 0)
 		{
@@ -84,29 +86,30 @@ calculate_database_size(Oid dbOid)
 	DIR		   *dirdesc;
 	struct dirent *direntry;
 	char		dirpath[MAXPGPATH];
-	char		pathname[MAXPGPATH];
+	char		pathname[MAXPGPATH + 21 + sizeof(TABLESPACE_VERSION_DIRECTORY)];
 	AclResult	aclresult;
 
-	/* User must have connect privilege for target database */
+	/*
+	 * User must have connect privilege for target database or be a member of
+	 * pg_read_all_stats
+	 */
 	aclresult = pg_database_aclcheck(dbOid, GetUserId(), ACL_CONNECT);
-	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, ACL_KIND_DATABASE,
+	if (aclresult != ACLCHECK_OK &&
+		!is_member_of_role(GetUserId(), DEFAULT_ROLE_READ_ALL_STATS))
+	{
+		aclcheck_error(aclresult, OBJECT_DATABASE,
 					   get_database_name(dbOid));
+	}
 
 	/* Shared storage in pg_global is not counted */
 
 	/* Include pg_default storage */
-	snprintf(pathname, MAXPGPATH, "base/%u", dbOid);
+	snprintf(pathname, sizeof(pathname), "base/%u", dbOid);
 	totalsize = db_dir_size(pathname);
 
 	/* Scan the non-default tablespaces */
 	snprintf(dirpath, MAXPGPATH, "pg_tblspc");
 	dirdesc = AllocateDir(dirpath);
-	if (!dirdesc)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open tablespace directory \"%s\": %m",
-						dirpath)));
 
 	while ((direntry = ReadDir(dirdesc, dirpath)) != NULL)
 	{
@@ -116,7 +119,7 @@ calculate_database_size(Oid dbOid)
 			strcmp(direntry->d_name, "..") == 0)
 			continue;
 
-		snprintf(pathname, MAXPGPATH, "pg_tblspc/%s/%s/%u",
+		snprintf(pathname, sizeof(pathname), "pg_tblspc/%s/%s/%u",
 				 direntry->d_name, TABLESPACE_VERSION_DIRECTORY, dbOid);
 		totalsize += db_dir_size(pathname);
 	}
@@ -164,22 +167,23 @@ static int64
 calculate_tablespace_size(Oid tblspcOid)
 {
 	char		tblspcPath[MAXPGPATH];
-	char		pathname[MAXPGPATH];
+	char		pathname[MAXPGPATH * 2];
 	int64		totalsize = 0;
 	DIR		   *dirdesc;
 	struct dirent *direntry;
 	AclResult	aclresult;
 
 	/*
-	 * User must have CREATE privilege for target tablespace, either
-	 * explicitly granted or implicitly because it is default for current
-	 * database.
+	 * User must be a member of pg_read_all_stats or have CREATE privilege for
+	 * target tablespace, either explicitly granted or implicitly because it
+	 * is default for current database.
 	 */
-	if (tblspcOid != MyDatabaseTableSpace)
+	if (tblspcOid != MyDatabaseTableSpace &&
+		!is_member_of_role(GetUserId(), DEFAULT_ROLE_READ_ALL_STATS))
 	{
 		aclresult = pg_tablespace_aclcheck(tblspcOid, GetUserId(), ACL_CREATE);
 		if (aclresult != ACLCHECK_OK)
-			aclcheck_error(aclresult, ACL_KIND_TABLESPACE,
+			aclcheck_error(aclresult, OBJECT_TABLESPACE,
 						   get_tablespace_name(tblspcOid));
 	}
 
@@ -206,7 +210,7 @@ calculate_tablespace_size(Oid tblspcOid)
 			strcmp(direntry->d_name, "..") == 0)
 			continue;
 
-		snprintf(pathname, MAXPGPATH, "%s/%s", tblspcPath, direntry->d_name);
+		snprintf(pathname, sizeof(pathname), "%s/%s", tblspcPath, direntry->d_name);
 
 		if (stat(pathname, &fst) < 0)
 		{
@@ -307,7 +311,7 @@ Datum
 pg_relation_size(PG_FUNCTION_ARGS)
 {
 	Oid			relOid = PG_GETARG_OID(0);
-	text	   *forkName = PG_GETARG_TEXT_P(1);
+	text	   *forkName = PG_GETARG_TEXT_PP(1);
 	Relation	rel;
 	int64		size;
 
@@ -324,7 +328,7 @@ pg_relation_size(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	size = calculate_relation_size(&(rel->rd_node), rel->rd_backend,
-							  forkname_to_number(text_to_cstring(forkName)));
+								   forkname_to_number(text_to_cstring(forkName)));
 
 	relation_close(rel, AccessShareLock);
 
@@ -534,31 +538,31 @@ pg_size_pretty(PG_FUNCTION_ARGS)
 	int64		limit = 10 * 1024;
 	int64		limit2 = limit * 2 - 1;
 
-	if (size < limit)
+	if (Abs(size) < limit)
 		snprintf(buf, sizeof(buf), INT64_FORMAT " bytes", size);
 	else
 	{
 		size >>= 9;				/* keep one extra bit for rounding */
-		if (size < limit2)
+		if (Abs(size) < limit2)
 			snprintf(buf, sizeof(buf), INT64_FORMAT " kB",
-					 (size + 1) / 2);
+					 half_rounded(size));
 		else
 		{
 			size >>= 10;
-			if (size < limit2)
+			if (Abs(size) < limit2)
 				snprintf(buf, sizeof(buf), INT64_FORMAT " MB",
-						 (size + 1) / 2);
+						 half_rounded(size));
 			else
 			{
 				size >>= 10;
-				if (size < limit2)
+				if (Abs(size) < limit2)
 					snprintf(buf, sizeof(buf), INT64_FORMAT " GB",
-							 (size + 1) / 2);
+							 half_rounded(size));
 				else
 				{
 					size >>= 10;
 					snprintf(buf, sizeof(buf), INT64_FORMAT " TB",
-							 (size + 1) / 2);
+							 half_rounded(size));
 				}
 			}
 		}
@@ -593,17 +597,34 @@ numeric_is_less(Numeric a, Numeric b)
 }
 
 static Numeric
-numeric_plus_one_over_two(Numeric n)
+numeric_absolute(Numeric n)
 {
 	Datum		d = NumericGetDatum(n);
+	Datum		result;
+
+	result = DirectFunctionCall1(numeric_abs, d);
+	return DatumGetNumeric(result);
+}
+
+static Numeric
+numeric_half_rounded(Numeric n)
+{
+	Datum		d = NumericGetDatum(n);
+	Datum		zero;
 	Datum		one;
 	Datum		two;
 	Datum		result;
 
+	zero = DirectFunctionCall1(int8_numeric, Int64GetDatum(0));
 	one = DirectFunctionCall1(int8_numeric, Int64GetDatum(1));
 	two = DirectFunctionCall1(int8_numeric, Int64GetDatum(2));
-	result = DirectFunctionCall2(numeric_add, d, one);
-	result = DirectFunctionCall2(numeric_div_trunc, result, two);
+
+	if (DatumGetBool(DirectFunctionCall2(numeric_ge, d, zero)))
+		d = DirectFunctionCall2(numeric_add, d, one);
+	else
+		d = DirectFunctionCall2(numeric_sub, d, one);
+
+	result = DirectFunctionCall2(numeric_div_trunc, d, two);
 	return DatumGetNumeric(result);
 }
 
@@ -632,7 +653,7 @@ pg_size_pretty_numeric(PG_FUNCTION_ARGS)
 	limit = int64_to_numeric(10 * 1024);
 	limit2 = int64_to_numeric(10 * 1024 * 2 - 1);
 
-	if (numeric_is_less(size, limit))
+	if (numeric_is_less(numeric_absolute(size), limit))
 	{
 		result = psprintf("%s bytes", numeric_to_cstring(size));
 	}
@@ -642,20 +663,18 @@ pg_size_pretty_numeric(PG_FUNCTION_ARGS)
 		/* size >>= 9 */
 		size = numeric_shift_right(size, 9);
 
-		if (numeric_is_less(size, limit2))
+		if (numeric_is_less(numeric_absolute(size), limit2))
 		{
-			/* size = (size + 1) / 2 */
-			size = numeric_plus_one_over_two(size);
+			size = numeric_half_rounded(size);
 			result = psprintf("%s kB", numeric_to_cstring(size));
 		}
 		else
 		{
 			/* size >>= 10 */
 			size = numeric_shift_right(size, 10);
-			if (numeric_is_less(size, limit2))
+			if (numeric_is_less(numeric_absolute(size), limit2))
 			{
-				/* size = (size + 1) / 2 */
-				size = numeric_plus_one_over_two(size);
+				size = numeric_half_rounded(size);
 				result = psprintf("%s MB", numeric_to_cstring(size));
 			}
 			else
@@ -663,18 +682,16 @@ pg_size_pretty_numeric(PG_FUNCTION_ARGS)
 				/* size >>= 10 */
 				size = numeric_shift_right(size, 10);
 
-				if (numeric_is_less(size, limit2))
+				if (numeric_is_less(numeric_absolute(size), limit2))
 				{
-					/* size = (size + 1) / 2 */
-					size = numeric_plus_one_over_two(size);
+					size = numeric_half_rounded(size);
 					result = psprintf("%s GB", numeric_to_cstring(size));
 				}
 				else
 				{
 					/* size >>= 10 */
 					size = numeric_shift_right(size, 10);
-					/* size = (size + 1) / 2 */
-					size = numeric_plus_one_over_two(size);
+					size = numeric_half_rounded(size);
 					result = psprintf("%s TB", numeric_to_cstring(size));
 				}
 			}
@@ -682,6 +699,152 @@ pg_size_pretty_numeric(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_TEXT_P(cstring_to_text(result));
+}
+
+/*
+ * Convert a human-readable size to a size in bytes
+ */
+Datum
+pg_size_bytes(PG_FUNCTION_ARGS)
+{
+	text	   *arg = PG_GETARG_TEXT_PP(0);
+	char	   *str,
+			   *strptr,
+			   *endptr;
+	char		saved_char;
+	Numeric		num;
+	int64		result;
+	bool		have_digits = false;
+
+	str = text_to_cstring(arg);
+
+	/* Skip leading whitespace */
+	strptr = str;
+	while (isspace((unsigned char) *strptr))
+		strptr++;
+
+	/* Check that we have a valid number and determine where it ends */
+	endptr = strptr;
+
+	/* Part (1): sign */
+	if (*endptr == '-' || *endptr == '+')
+		endptr++;
+
+	/* Part (2): main digit string */
+	if (isdigit((unsigned char) *endptr))
+	{
+		have_digits = true;
+		do
+			endptr++;
+		while (isdigit((unsigned char) *endptr));
+	}
+
+	/* Part (3): optional decimal point and fractional digits */
+	if (*endptr == '.')
+	{
+		endptr++;
+		if (isdigit((unsigned char) *endptr))
+		{
+			have_digits = true;
+			do
+				endptr++;
+			while (isdigit((unsigned char) *endptr));
+		}
+	}
+
+	/* Complain if we don't have a valid number at this point */
+	if (!have_digits)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid size: \"%s\"", str)));
+
+	/* Part (4): optional exponent */
+	if (*endptr == 'e' || *endptr == 'E')
+	{
+		long		exponent;
+		char	   *cp;
+
+		/*
+		 * Note we might one day support EB units, so if what follows 'E'
+		 * isn't a number, just treat it all as a unit to be parsed.
+		 */
+		exponent = strtol(endptr + 1, &cp, 10);
+		(void) exponent;		/* Silence -Wunused-result warnings */
+		if (cp > endptr + 1)
+			endptr = cp;
+	}
+
+	/*
+	 * Parse the number, saving the next character, which may be the first
+	 * character of the unit string.
+	 */
+	saved_char = *endptr;
+	*endptr = '\0';
+
+	num = DatumGetNumeric(DirectFunctionCall3(numeric_in,
+											  CStringGetDatum(strptr),
+											  ObjectIdGetDatum(InvalidOid),
+											  Int32GetDatum(-1)));
+
+	*endptr = saved_char;
+
+	/* Skip whitespace between number and unit */
+	strptr = endptr;
+	while (isspace((unsigned char) *strptr))
+		strptr++;
+
+	/* Handle possible unit */
+	if (*strptr != '\0')
+	{
+		int64		multiplier = 0;
+
+		/* Trim any trailing whitespace */
+		endptr = str + VARSIZE_ANY_EXHDR(arg) - 1;
+
+		while (isspace((unsigned char) *endptr))
+			endptr--;
+
+		endptr++;
+		*endptr = '\0';
+
+		/* Parse the unit case-insensitively */
+		if (pg_strcasecmp(strptr, "bytes") == 0)
+			multiplier = (int64) 1;
+		else if (pg_strcasecmp(strptr, "kb") == 0)
+			multiplier = (int64) 1024;
+		else if (pg_strcasecmp(strptr, "mb") == 0)
+			multiplier = ((int64) 1024) * 1024;
+
+		else if (pg_strcasecmp(strptr, "gb") == 0)
+			multiplier = ((int64) 1024) * 1024 * 1024;
+
+		else if (pg_strcasecmp(strptr, "tb") == 0)
+			multiplier = ((int64) 1024) * 1024 * 1024 * 1024;
+
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid size: \"%s\"", text_to_cstring(arg)),
+					 errdetail("Invalid size unit: \"%s\".", strptr),
+					 errhint("Valid units are \"bytes\", \"kB\", \"MB\", \"GB\", and \"TB\".")));
+
+		if (multiplier > 1)
+		{
+			Numeric		mul_num;
+
+			mul_num = DatumGetNumeric(DirectFunctionCall1(int8_numeric,
+														  Int64GetDatum(multiplier)));
+
+			num = DatumGetNumeric(DirectFunctionCall2(numeric_mul,
+													  NumericGetDatum(mul_num),
+													  NumericGetDatum(num)));
+		}
+	}
+
+	result = DatumGetInt64(DirectFunctionCall1(numeric_int8,
+											   NumericGetDatum(num)));
+
+	PG_RETURN_INT64(result);
 }
 
 /*
@@ -721,7 +884,7 @@ pg_relation_filenode(PG_FUNCTION_ARGS)
 			/* okay, these have storage */
 			if (relform->relfilenode)
 				result = relform->relfilenode;
-			else	/* Consult the relation mapper */
+			else				/* Consult the relation mapper */
 				result = RelationMapOidToFilenode(relid,
 												  relform->relisshared);
 			break;
@@ -808,9 +971,9 @@ pg_relation_filepath(PG_FUNCTION_ARGS)
 				rnode.dbNode = MyDatabaseId;
 			if (relform->relfilenode)
 				rnode.relNode = relform->relfilenode;
-			else	/* Consult the relation mapper */
+			else				/* Consult the relation mapper */
 				rnode.relNode = RelationMapOidToFilenode(relid,
-													   relform->relisshared);
+														 relform->relisshared);
 			break;
 
 		default:
@@ -837,7 +1000,7 @@ pg_relation_filepath(PG_FUNCTION_ARGS)
 			break;
 		case RELPERSISTENCE_TEMP:
 			if (isTempOrTempToastNamespace(relform->relnamespace))
-				backend = MyBackendId;
+				backend = BackendIdForTempRelations();
 			else
 			{
 				/* Do it the hard way. */

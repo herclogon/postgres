@@ -19,12 +19,10 @@ include $(top_builddir)/src/Makefile.global
 OBJS= localtime.o strftime.o pgtz.o
 
 # files needed to build zic utility program
-ZICOBJS= zic.o ialloc.o scheck.o localtime.o $(WIN32RES)
+ZICOBJS= zic.o $(WIN32RES)
 
-# timezone data files
-TZDATA = africa antarctica asia australasia europe northamerica southamerica \
-	pacificnew etcetera factory backward systemv
-TZDATAFILES = $(TZDATA:%=$(srcdir)/data/%)
+# we now distribute the timezone data as a single file
+TZDATAFILES = $(srcdir)/data/tzdata.zi
 
 # which zone should determine the DST rules (not the specific UTC offset!)
 # for POSIX-style timezone specs

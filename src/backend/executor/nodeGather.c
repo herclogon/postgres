@@ -3,9 +3,24 @@
  * nodeGather.c
  *	  Support routines for scanning a plan via multiple workers.
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * A Gather executor launches parallel workers to run multiple copies of a
+ * plan.  It can also run the plan itself, if the workers are not available
+ * or have not started up yet.  It then merges all of the results it produces
+ * and the results from the workers into a single output stream.  Therefore,
+ * it will normally be used with a plan where running multiple copies of the
+ * same plan does not produce duplicate output, such as parallel-aware
+ * SeqScan.
+ *
+ * Alternatively, a Gather node can be configured to use just one worker
+ * and the single-copy flag can be set.  In this case, the Gather node will
+ * run the plan in one worker and will not execute the plan itself.  In
+ * this case, it simply returns whatever tuples were returned by the worker.
+ * If a worker cannot be obtained, then it will run the plan itself and
+ * return the results.  Therefore, a plan used with a single-copy Gather
+ * node need not be parallel-aware.
  *
  * IDENTIFICATION
  *	  src/backend/executor/nodeGather.c
@@ -22,10 +37,17 @@
 #include "executor/nodeGather.h"
 #include "executor/nodeSubplan.h"
 #include "executor/tqueue.h"
+#include "miscadmin.h"
+#include "optimizer/planmain.h"
+#include "pgstat.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 
+static TupleTableSlot *ExecGather(PlanState *pstate);
 static TupleTableSlot *gather_getnext(GatherState *gatherstate);
+static HeapTuple gather_readnext(GatherState *gatherstate);
+static void ExecShutdownGatherWorkers(GatherState *node);
 
 
 /* ----------------------------------------------------------------
@@ -36,6 +58,8 @@ GatherState *
 ExecInitGather(Gather *node, EState *estate, int eflags)
 {
 	GatherState *gatherstate;
+	Plan	   *outerNode;
+	TupleDesc	tupDesc;
 
 	/* Gather node doesn't have innerPlan node. */
 	Assert(innerPlan(node) == NULL);
@@ -46,7 +70,12 @@ ExecInitGather(Gather *node, EState *estate, int eflags)
 	gatherstate = makeNode(GatherState);
 	gatherstate->ps.plan = (Plan *) node;
 	gatherstate->ps.state = estate;
-	gatherstate->need_to_scan_locally = !node->single_copy;
+	gatherstate->ps.ExecProcNode = ExecGather;
+
+	gatherstate->initialized = false;
+	gatherstate->need_to_scan_locally =
+		!node->single_copy && parallel_leader_participation;
+	gatherstate->tuples_needed = -1;
 
 	/*
 	 * Miscellaneous initialization
@@ -56,33 +85,48 @@ ExecInitGather(Gather *node, EState *estate, int eflags)
 	ExecAssignExprContext(estate, &gatherstate->ps);
 
 	/*
-	 * initialize child expressions
-	 */
-	gatherstate->ps.targetlist = (List *)
-		ExecInitExpr((Expr *) node->plan.targetlist,
-					 (PlanState *) gatherstate);
-	gatherstate->ps.qual = (List *)
-		ExecInitExpr((Expr *) node->plan.qual,
-					 (PlanState *) gatherstate);
-
-	/*
-	 * tuple table initialization
-	 */
-	ExecInitResultTupleSlot(estate, &gatherstate->ps);
-
-	/*
 	 * now initialize outer plan
 	 */
-	outerPlanState(gatherstate) = ExecInitNode(outerPlan(node), estate, eflags);
-
-
-	gatherstate->ps.ps_TupFromTlist = false;
+	outerNode = outerPlan(node);
+	outerPlanState(gatherstate) = ExecInitNode(outerNode, estate, eflags);
+	tupDesc = ExecGetResultType(outerPlanState(gatherstate));
 
 	/*
-	 * Initialize result tuple type and projection info.
+	 * Leader may access ExecProcNode result directly (if
+	 * need_to_scan_locally), or from workers via tuple queue.  So we can't
+	 * trivially rely on the slot type being fixed for expressions evaluated
+	 * within this node.
 	 */
-	ExecAssignResultTypeFromTL(&gatherstate->ps);
-	ExecAssignProjectionInfo(&gatherstate->ps, NULL);
+	gatherstate->ps.outeropsset = true;
+	gatherstate->ps.outeropsfixed = false;
+
+	/*
+	 * Initialize result type and projection.
+	 */
+	ExecInitResultTypeTL(&gatherstate->ps);
+	ExecConditionalAssignProjectionInfo(&gatherstate->ps, tupDesc, OUTER_VAR);
+
+	/*
+	 * Without projections result slot type is not trivially known, see
+	 * comment above.
+	 */
+	if (gatherstate->ps.ps_ProjInfo == NULL)
+	{
+		gatherstate->ps.resultopsset = true;
+		gatherstate->ps.resultopsfixed = false;
+	}
+
+	/*
+	 * Initialize funnel slot to same tuple descriptor as outer plan.
+	 */
+	gatherstate->funnel_slot = ExecInitExtraTupleSlot(estate, tupDesc,
+													  &TTSOpsHeapTuple);
+
+	/*
+	 * Gather doesn't support checking a qual (it's always more efficient to
+	 * do it in the child node).
+	 */
+	Assert(!node->plan.qual);
 
 	return gatherstate;
 }
@@ -94,17 +138,20 @@ ExecInitGather(Gather *node, EState *estate, int eflags)
  *		the next qualifying tuple.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *
-ExecGather(GatherState *node)
+static TupleTableSlot *
+ExecGather(PlanState *pstate)
 {
-	int			i;
+	GatherState *node = castNode(GatherState, pstate);
 	TupleTableSlot *slot;
+	ExprContext *econtext;
+
+	CHECK_FOR_INTERRUPTS();
 
 	/*
 	 * Initialize the parallel context and workers on first execution. We do
 	 * this on first execution rather than during node initialization, as it
-	 * needs to allocate large dynamic segement, so it is better to do if it
-	 * is really needed.
+	 * needs to allocate a large dynamic segment, so it is better to do it
+	 * only if it is really needed.
 	 */
 	if (!node->initialized)
 	{
@@ -112,52 +159,84 @@ ExecGather(GatherState *node)
 		Gather	   *gather = (Gather *) node->ps.plan;
 
 		/*
-		 * Sometimes we might have to run without parallelism; but if
-		 * parallel mode is active then we can try to fire up some workers.
+		 * Sometimes we might have to run without parallelism; but if parallel
+		 * mode is active then we can try to fire up some workers.
 		 */
-		if (gather->num_workers > 0 && IsInParallelMode())
+		if (gather->num_workers > 0 && estate->es_use_parallel_mode)
 		{
-			bool	got_any_worker = false;
+			ParallelContext *pcxt;
 
-			/* Initialize the workers required to execute Gather node. */
-			node->pei = ExecInitParallelPlan(node->ps.lefttree,
-											 estate,
-											 gather->num_workers);
+			/* Initialize, or re-initialize, shared state needed by workers. */
+			if (!node->pei)
+				node->pei = ExecInitParallelPlan(node->ps.lefttree,
+												 estate,
+												 gather->initParam,
+												 gather->num_workers,
+												 node->tuples_needed);
+			else
+				ExecParallelReinitialize(node->ps.lefttree,
+										 node->pei,
+										 gather->initParam);
 
 			/*
 			 * Register backend workers. We might not get as many as we
 			 * requested, or indeed any at all.
 			 */
-			LaunchParallelWorkers(node->pei->pcxt);
+			pcxt = node->pei->pcxt;
+			LaunchParallelWorkers(pcxt);
+			/* We save # workers launched for the benefit of EXPLAIN */
+			node->nworkers_launched = pcxt->nworkers_launched;
 
-			/* Set up a tuple queue to collect the results. */
-			node->funnel = CreateTupleQueueFunnel();
-			for (i = 0; i < node->pei->pcxt->nworkers; ++i)
+			/* Set up tuple queue readers to read the results. */
+			if (pcxt->nworkers_launched > 0)
 			{
-				if (node->pei->pcxt->worker[i].bgwhandle)
-				{
-					shm_mq_set_handle(node->pei->tqueue[i],
-									  node->pei->pcxt->worker[i].bgwhandle);
-					RegisterTupleQueueOnFunnel(node->funnel,
-											   node->pei->tqueue[i]);
-					got_any_worker = true;
-				}
+				ExecParallelCreateReaders(node->pei);
+				/* Make a working array showing the active readers */
+				node->nreaders = pcxt->nworkers_launched;
+				node->reader = (TupleQueueReader **)
+					palloc(node->nreaders * sizeof(TupleQueueReader *));
+				memcpy(node->reader, node->pei->reader,
+					   node->nreaders * sizeof(TupleQueueReader *));
 			}
-
-			/* No workers?  Then never mind. */
-			if (!got_any_worker)
-				ExecShutdownGather(node);
+			else
+			{
+				/* No workers?	Then never mind. */
+				node->nreaders = 0;
+				node->reader = NULL;
+			}
+			node->nextreader = 0;
 		}
 
-		/* Run plan locally if no workers or not single-copy. */
-		node->need_to_scan_locally = (node->funnel == NULL)
-			|| !gather->single_copy;
+		/* Run plan locally if no workers or enabled and not single-copy. */
+		node->need_to_scan_locally = (node->nreaders == 0)
+			|| (!gather->single_copy && parallel_leader_participation);
 		node->initialized = true;
 	}
 
-	slot = gather_getnext(node);
+	/*
+	 * Reset per-tuple memory context to free any expression evaluation
+	 * storage allocated in the previous tuple cycle.
+	 */
+	econtext = node->ps.ps_ExprContext;
+	ResetExprContext(econtext);
 
-	return slot;
+	/*
+	 * Get next tuple, either from one of our workers, or by running the plan
+	 * ourselves.
+	 */
+	slot = gather_getnext(node);
+	if (TupIsNull(slot))
+		return NULL;
+
+	/* If no projection is required, we're done. */
+	if (node->ps.ps_ProjInfo == NULL)
+		return slot;
+
+	/*
+	 * Form the result tuple using ExecProject(), and return it.
+	 */
+	econtext->ecxt_outertuple = slot;
+	return ExecProject(node->ps.ps_ProjInfo);
 }
 
 /* ----------------------------------------------------------------
@@ -169,66 +248,52 @@ ExecGather(GatherState *node)
 void
 ExecEndGather(GatherState *node)
 {
+	ExecEndNode(outerPlanState(node));	/* let children clean up first */
 	ExecShutdownGather(node);
 	ExecFreeExprContext(&node->ps);
-	ExecClearTuple(node->ps.ps_ResultTupleSlot);
-	ExecEndNode(outerPlanState(node));
+	if (node->ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ps.ps_ResultTupleSlot);
 }
 
 /*
- * gather_getnext
- *
- * Get the next tuple from shared memory queue.  This function
- * is reponsible for fetching tuples from all the queues associated
- * with worker backends used in Gather node execution and if there is
- * no data available from queues or no worker is available, it does
- * fetch the data from local node.
+ * Read the next tuple.  We might fetch a tuple from one of the tuple queues
+ * using gather_readnext, or if no tuple queue contains a tuple and the
+ * single_copy flag is not set, we might generate one locally instead.
  */
 static TupleTableSlot *
 gather_getnext(GatherState *gatherstate)
 {
-	PlanState  *outerPlan;
+	PlanState  *outerPlan = outerPlanState(gatherstate);
 	TupleTableSlot *outerTupleSlot;
-	TupleTableSlot *slot;
+	TupleTableSlot *fslot = gatherstate->funnel_slot;
 	HeapTuple	tup;
 
-	/*
-	 * We can use projection info of Gather for the tuples received from
-	 * worker backends as currently for all cases worker backends sends the
-	 * projected tuple as required by Gather node.
-	 */
-	slot = gatherstate->ps.ps_ProjInfo->pi_slot;
-
-	while (gatherstate->funnel != NULL || gatherstate->need_to_scan_locally)
+	while (gatherstate->nreaders > 0 || gatherstate->need_to_scan_locally)
 	{
-		if (gatherstate->funnel != NULL)
-		{
-			bool		done = false;
+		CHECK_FOR_INTERRUPTS();
 
-			/* wait only if local scan is done */
-			tup = TupleQueueFunnelNext(gatherstate->funnel,
-									   gatherstate->need_to_scan_locally,
-									   &done);
-			if (done)
-				ExecShutdownGather(gatherstate);
+		if (gatherstate->nreaders > 0)
+		{
+			tup = gather_readnext(gatherstate);
 
 			if (HeapTupleIsValid(tup))
 			{
-				ExecStoreTuple(tup,		/* tuple to store */
-							   slot,	/* slot to store in */
-							   InvalidBuffer,	/* buffer associated with this
-												 * tuple */
-							   true);	/* pfree this pointer if not from heap */
-
-				return slot;
+				ExecStoreHeapTuple(tup, /* tuple to store */
+								   fslot,	/* slot to store the tuple */
+								   true);	/* pfree tuple when done with it */
+				return fslot;
 			}
 		}
 
 		if (gatherstate->need_to_scan_locally)
 		{
-			outerPlan = outerPlanState(gatherstate);
+			EState	   *estate = gatherstate->ps.state;
 
+			/* Install our DSA area while executing the plan. */
+			estate->es_query_dsa =
+				gatherstate->pei ? gatherstate->pei->area : NULL;
 			outerTupleSlot = ExecProcNode(outerPlan);
+			estate->es_query_dsa = NULL;
 
 			if (!TupIsNull(outerTupleSlot))
 				return outerTupleSlot;
@@ -237,31 +302,126 @@ gather_getnext(GatherState *gatherstate)
 		}
 	}
 
-	return ExecClearTuple(slot);
+	return ExecClearTuple(fslot);
+}
+
+/*
+ * Attempt to read a tuple from one of our parallel workers.
+ */
+static HeapTuple
+gather_readnext(GatherState *gatherstate)
+{
+	int			nvisited = 0;
+
+	for (;;)
+	{
+		TupleQueueReader *reader;
+		HeapTuple	tup;
+		bool		readerdone;
+
+		/* Check for async events, particularly messages from workers. */
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Attempt to read a tuple, but don't block if none is available.
+		 *
+		 * Note that TupleQueueReaderNext will just return NULL for a worker
+		 * which fails to initialize.  We'll treat that worker as having
+		 * produced no tuples; WaitForParallelWorkersToFinish will error out
+		 * when we get there.
+		 */
+		Assert(gatherstate->nextreader < gatherstate->nreaders);
+		reader = gatherstate->reader[gatherstate->nextreader];
+		tup = TupleQueueReaderNext(reader, true, &readerdone);
+
+		/*
+		 * If this reader is done, remove it from our working array of active
+		 * readers.  If all readers are done, we're outta here.
+		 */
+		if (readerdone)
+		{
+			Assert(!tup);
+			--gatherstate->nreaders;
+			if (gatherstate->nreaders == 0)
+			{
+				ExecShutdownGatherWorkers(gatherstate);
+				return NULL;
+			}
+			memmove(&gatherstate->reader[gatherstate->nextreader],
+					&gatherstate->reader[gatherstate->nextreader + 1],
+					sizeof(TupleQueueReader *)
+					* (gatherstate->nreaders - gatherstate->nextreader));
+			if (gatherstate->nextreader >= gatherstate->nreaders)
+				gatherstate->nextreader = 0;
+			continue;
+		}
+
+		/* If we got a tuple, return it. */
+		if (tup)
+			return tup;
+
+		/*
+		 * Advance nextreader pointer in round-robin fashion.  Note that we
+		 * only reach this code if we weren't able to get a tuple from the
+		 * current worker.  We used to advance the nextreader pointer after
+		 * every tuple, but it turns out to be much more efficient to keep
+		 * reading from the same queue until that would require blocking.
+		 */
+		gatherstate->nextreader++;
+		if (gatherstate->nextreader >= gatherstate->nreaders)
+			gatherstate->nextreader = 0;
+
+		/* Have we visited every (surviving) TupleQueueReader? */
+		nvisited++;
+		if (nvisited >= gatherstate->nreaders)
+		{
+			/*
+			 * If (still) running plan locally, return NULL so caller can
+			 * generate another tuple from the local copy of the plan.
+			 */
+			if (gatherstate->need_to_scan_locally)
+				return NULL;
+
+			/* Nothing to do except wait for developments. */
+			WaitLatch(MyLatch, WL_LATCH_SET, 0, WAIT_EVENT_EXECUTE_GATHER);
+			ResetLatch(MyLatch);
+			nvisited = 0;
+		}
+	}
+}
+
+/* ----------------------------------------------------------------
+ *		ExecShutdownGatherWorkers
+ *
+ *		Stop all the parallel workers.
+ * ----------------------------------------------------------------
+ */
+static void
+ExecShutdownGatherWorkers(GatherState *node)
+{
+	if (node->pei != NULL)
+		ExecParallelFinish(node->pei);
+
+	/* Flush local copy of reader array */
+	if (node->reader)
+		pfree(node->reader);
+	node->reader = NULL;
 }
 
 /* ----------------------------------------------------------------
  *		ExecShutdownGather
  *
- *		Destroy the setup for parallel workers.  Collect all the
- *		stats after workers are stopped, else some work done by
- *		workers won't be accounted.
+ *		Destroy the setup for parallel workers including parallel context.
  * ----------------------------------------------------------------
  */
 void
 ExecShutdownGather(GatherState *node)
 {
-	/* Shut down tuple queue funnel before shutting down workers. */
-	if (node->funnel != NULL)
-	{
-		DestroyTupleQueueFunnel(node->funnel);
-		node->funnel = NULL;
-	}
+	ExecShutdownGatherWorkers(node);
 
-	/* Now shut down the workers. */
+	/* Now destroy the parallel context. */
 	if (node->pei != NULL)
 	{
-		ExecParallelFinish(node->pei);
 		ExecParallelCleanup(node->pei);
 		node->pei = NULL;
 	}
@@ -275,21 +435,42 @@ ExecShutdownGather(GatherState *node)
 /* ----------------------------------------------------------------
  *		ExecReScanGather
  *
- *		Re-initialize the workers and rescans a relation via them.
+ *		Prepare to re-scan the result of a Gather.
  * ----------------------------------------------------------------
  */
 void
 ExecReScanGather(GatherState *node)
 {
-	/*
-	 * Re-initialize the parallel context and workers to perform rescan of
-	 * relation.  We want to gracefully shutdown all the workers so that they
-	 * should be able to propagate any error or other information to master
-	 * backend before dying.
-	 */
-	ExecShutdownGather(node);
+	Gather	   *gather = (Gather *) node->ps.plan;
+	PlanState  *outerPlan = outerPlanState(node);
 
+	/* Make sure any existing workers are gracefully shut down */
+	ExecShutdownGatherWorkers(node);
+
+	/* Mark node so that shared state will be rebuilt at next call */
 	node->initialized = false;
 
-	ExecReScan(node->ps.lefttree);
+	/*
+	 * Set child node's chgParam to tell it that the next scan might deliver a
+	 * different set of rows within the leader process.  (The overall rowset
+	 * shouldn't change, but the leader process's subset might; hence nodes
+	 * between here and the parallel table scan node mustn't optimize on the
+	 * assumption of an unchanging rowset.)
+	 */
+	if (gather->rescan_param >= 0)
+		outerPlan->chgParam = bms_add_member(outerPlan->chgParam,
+											 gather->rescan_param);
+
+	/*
+	 * If chgParam of subnode is not null then plan will be re-scanned by
+	 * first ExecProcNode.  Note: because this does nothing if we have a
+	 * rescan_param, it's currently guaranteed that parallel-aware child nodes
+	 * will not see a ReScan call until after they get a ReInitializeDSM call.
+	 * That ordering might not be something to rely on, though.  A good rule
+	 * of thumb is that ReInitializeDSM should reset only shared state, ReScan
+	 * should reset only local state, and anything that depends on both of
+	 * those steps being finished must wait until the first ExecProcNode call.
+	 */
+	if (outerPlan->chgParam == NULL)
+		ExecReScan(outerPlan);
 }

@@ -3,7 +3,7 @@
  * lmgr.c
  *	  POSTGRES lock manager code
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,7 +33,7 @@
  * constraint violations.  It's theoretically possible that a backend sees a
  * tuple that was speculatively inserted by another backend, but before it has
  * started waiting on the token, the other backend completes its insertion,
- * and then then performs 2^32 unrelated insertions.  And after all that, the
+ * and then performs 2^32 unrelated insertions.  And after all that, the
  * first backend finally calls SpeculativeInsertionLockAcquire(), with the
  * intention of waiting for the first insertion to complete, but ends up
  * waiting for the latest unrelated insertion instead.  Even then, nothing
@@ -105,11 +105,12 @@ void
 LockRelationOid(Oid relid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SetLocktagRelationOid(&tag, relid);
 
-	res = LockAcquire(&tag, lockmode, false, false);
+	res = LockAcquireExtended(&tag, lockmode, false, false, true, &locallock);
 
 	/*
 	 * Now that we have the lock, check for invalidation messages, so that we
@@ -120,16 +121,25 @@ LockRelationOid(Oid relid, LOCKMODE lockmode)
 	 * relcache entry in an undesirable way.  (In the case where our own xact
 	 * modifies the rel, the relcache update happens via
 	 * CommandCounterIncrement, not here.)
+	 *
+	 * However, in corner cases where code acts on tables (usually catalogs)
+	 * recursively, we might get here while still processing invalidation
+	 * messages in some outer execution of this function or a sibling.  The
+	 * "cleared" status of the lock tells us whether we really are done
+	 * absorbing relevant inval messages.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 }
 
 /*
  *		ConditionalLockRelationOid
  *
  * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE iff the lock was acquired.
+ * Returns true iff the lock was acquired.
  *
  * NOTE: we do not currently need conditional versions of all the
  * LockXXX routines in this file, but they could easily be added if needed.
@@ -138,11 +148,12 @@ bool
 ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SetLocktagRelationOid(&tag, relid);
 
-	res = LockAcquire(&tag, lockmode, false, true);
+	res = LockAcquireExtended(&tag, lockmode, false, true, true, &locallock);
 
 	if (res == LOCKACQUIRE_NOT_AVAIL)
 		return false;
@@ -151,8 +162,11 @@ ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
 	 * Now that we have the lock, check for invalidation messages; see notes
 	 * in LockRelationOid.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 
 	return true;
 }
@@ -199,20 +213,24 @@ void
 LockRelation(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SET_LOCKTAG_RELATION(tag,
 						 relation->rd_lockInfo.lockRelId.dbId,
 						 relation->rd_lockInfo.lockRelId.relId);
 
-	res = LockAcquire(&tag, lockmode, false, false);
+	res = LockAcquireExtended(&tag, lockmode, false, false, true, &locallock);
 
 	/*
 	 * Now that we have the lock, check for invalidation messages; see notes
 	 * in LockRelationOid.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 }
 
 /*
@@ -226,13 +244,14 @@ bool
 ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
 {
 	LOCKTAG		tag;
+	LOCALLOCK  *locallock;
 	LockAcquireResult res;
 
 	SET_LOCKTAG_RELATION(tag,
 						 relation->rd_lockInfo.lockRelId.dbId,
 						 relation->rd_lockInfo.lockRelId.relId);
 
-	res = LockAcquire(&tag, lockmode, false, true);
+	res = LockAcquireExtended(&tag, lockmode, false, true, true, &locallock);
 
 	if (res == LOCKACQUIRE_NOT_AVAIL)
 		return false;
@@ -241,8 +260,11 @@ ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
 	 * Now that we have the lock, check for invalidation messages; see notes
 	 * in LockRelationOid.
 	 */
-	if (res != LOCKACQUIRE_ALREADY_HELD)
+	if (res != LOCKACQUIRE_ALREADY_CLEAR)
+	{
 		AcceptInvalidationMessages();
+		MarkLockClear(locallock);
+	}
 
 	return true;
 }
@@ -266,10 +288,55 @@ UnlockRelation(Relation relation, LOCKMODE lockmode)
 }
 
 /*
+ *		CheckRelationLockedByMe
+ *
+ * Returns true if current transaction holds a lock on 'relation' of mode
+ * 'lockmode'.  If 'orstronger' is true, a stronger lockmode is also OK.
+ * ("Stronger" is defined as "numerically higher", which is a bit
+ * semantically dubious but is OK for the purposes we use this for.)
+ */
+bool
+CheckRelationLockedByMe(Relation relation, LOCKMODE lockmode, bool orstronger)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION(tag,
+						 relation->rd_lockInfo.lockRelId.dbId,
+						 relation->rd_lockInfo.lockRelId.relId);
+
+	if (LockHeldByMe(&tag, lockmode))
+		return true;
+
+	if (orstronger)
+	{
+		LOCKMODE	slockmode;
+
+		for (slockmode = lockmode + 1;
+			 slockmode <= MaxLockMode;
+			 slockmode++)
+		{
+			if (LockHeldByMe(&tag, slockmode))
+			{
+#ifdef NOT_USED
+				/* Sometimes this might be useful for debugging purposes */
+				elog(WARNING, "lock mode %s substituted for %s on relation %s",
+					 GetLockmodeName(tag.locktag_lockmethodid, slockmode),
+					 GetLockmodeName(tag.locktag_lockmethodid, lockmode),
+					 RelationGetRelationName(relation));
+#endif
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+/*
  *		LockHasWaitersRelation
  *
- * This is a functiion to check if someone else is waiting on a
- * lock, we are currently holding.
+ * This is a function to check whether someone else is waiting for a
+ * lock which we are currently holding.
  */
 bool
 LockHasWaitersRelation(Relation relation, LOCKMODE lockmode)
@@ -341,6 +408,41 @@ LockRelationForExtension(Relation relation, LOCKMODE lockmode)
 }
 
 /*
+ *		ConditionalLockRelationForExtension
+ *
+ * As above, but only lock if we can get the lock without blocking.
+ * Returns true iff the lock was acquired.
+ */
+bool
+ConditionalLockRelationForExtension(Relation relation, LOCKMODE lockmode)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION_EXTEND(tag,
+								relation->rd_lockInfo.lockRelId.dbId,
+								relation->rd_lockInfo.lockRelId.relId);
+
+	return (LockAcquire(&tag, lockmode, false, true) != LOCKACQUIRE_NOT_AVAIL);
+}
+
+/*
+ *		RelationExtensionLockWaiterCount
+ *
+ * Count the number of processes waiting for the given relation extension lock.
+ */
+int
+RelationExtensionLockWaiterCount(Relation relation)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_RELATION_EXTEND(tag,
+								relation->rd_lockInfo.lockRelId.dbId,
+								relation->rd_lockInfo.lockRelId.relId);
+
+	return LockWaiterCount(&tag);
+}
+
+/*
  *		UnlockRelationForExtension
  */
 void
@@ -378,7 +480,7 @@ LockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode)
  *		ConditionalLockPage
  *
  * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE iff the lock was acquired.
+ * Returns true iff the lock was acquired.
  */
 bool
 ConditionalLockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode)
@@ -434,7 +536,7 @@ LockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode)
  *		ConditionalLockTuple
  *
  * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE iff the lock was acquired.
+ * Returns true iff the lock was acquired.
  */
 bool
 ConditionalLockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode)
@@ -522,6 +624,7 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 	LOCKTAG		tag;
 	XactLockTableWaitInfo info;
 	ErrorContextCallback callback;
+	bool		first = true;
 
 	/*
 	 * If an operation is specified, set up our verbose error context
@@ -555,7 +658,26 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
 
 		if (!TransactionIdIsInProgress(xid))
 			break;
-		xid = SubTransGetParent(xid);
+
+		/*
+		 * If the Xid belonged to a subtransaction, then the lock would have
+		 * gone away as soon as it was finished; for correct tuple visibility,
+		 * the right action is to wait on its parent transaction to go away.
+		 * But instead of going levels up one by one, we can just wait for the
+		 * topmost transaction to finish with the same end result, which also
+		 * incurs less locktable traffic.
+		 *
+		 * Some uses of this function don't involve tuple visibility -- such
+		 * as when building snapshots for logical decoding.  It is possible to
+		 * see a transaction in ProcArray before it registers itself in the
+		 * locktable.  The topmost transaction in that case is the same xid,
+		 * so we try again after a short sleep.  (Don't sleep the first time
+		 * through, to avoid slowing down the normal case.)
+		 */
+		if (!first)
+			pg_usleep(1000L);
+		first = false;
+		xid = SubTransGetTopmostTransaction(xid);
 	}
 
 	if (oper != XLTW_None)
@@ -566,12 +688,13 @@ XactLockTableWait(TransactionId xid, Relation rel, ItemPointer ctid,
  *		ConditionalXactLockTableWait
  *
  * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE if the lock was acquired.
+ * Returns true if the lock was acquired.
  */
 bool
 ConditionalXactLockTableWait(TransactionId xid)
 {
 	LOCKTAG		tag;
+	bool		first = true;
 
 	for (;;)
 	{
@@ -587,7 +710,12 @@ ConditionalXactLockTableWait(TransactionId xid)
 
 		if (!TransactionIdIsInProgress(xid))
 			break;
-		xid = SubTransGetParent(xid);
+
+		/* See XactLockTableWait about this case */
+		if (!first)
+			pg_usleep(1000L);
+		first = false;
+		xid = SubTransGetTopmostTransaction(xid);
 	}
 
 	return true;
@@ -993,4 +1121,17 @@ DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 							 (int) tag->locktag_type);
 			break;
 	}
+}
+
+/*
+ * GetLockNameFromTagType
+ *
+ *	Given locktag type, return the corresponding lock name.
+ */
+const char *
+GetLockNameFromTagType(uint16 locktag_type)
+{
+	if (locktag_type > LOCKTAG_LAST_TYPE)
+		return "???";
+	return LockTagTypeNames[locktag_type];
 }

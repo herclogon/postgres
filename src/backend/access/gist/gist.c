@@ -4,7 +4,7 @@
  *	  interface routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,21 +14,23 @@
  */
 #include "postgres.h"
 
-#include "access/genam.h"
 #include "access/gist_private.h"
-#include "access/xloginsert.h"
-#include "catalog/index.h"
+#include "access/gistscan.h"
 #include "catalog/pg_collation.h"
 #include "miscadmin.h"
-#include "storage/bufmgr.h"
-#include "storage/indexfsm.h"
+#include "storage/lmgr.h"
+#include "storage/predicate.h"
+#include "nodes/execnodes.h"
+#include "utils/builtins.h"
+#include "utils/index_selfuncs.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+
 
 /* non-export function prototypes */
 static void gistfixsplit(GISTInsertState *state, GISTSTATE *giststate);
 static bool gistinserttuple(GISTInsertState *state, GISTInsertStack *stack,
-			 GISTSTATE *giststate, IndexTuple tuple, OffsetNumber oldoffnum);
+				GISTSTATE *giststate, IndexTuple tuple, OffsetNumber oldoffnum);
 static bool gistinserttuples(GISTInsertState *state, GISTInsertStack *stack,
 				 GISTSTATE *giststate,
 				 IndexTuple *tuples, int ntup, OffsetNumber oldoffnum,
@@ -50,6 +52,56 @@ static void gistvacuumpage(Relation rel, Page page, Buffer buffer);
 
 
 /*
+ * GiST handler function: return IndexAmRoutine with access method parameters
+ * and callbacks.
+ */
+Datum
+gisthandler(PG_FUNCTION_ARGS)
+{
+	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+
+	amroutine->amstrategies = 0;
+	amroutine->amsupport = GISTNProcs;
+	amroutine->amcanorder = false;
+	amroutine->amcanorderbyop = true;
+	amroutine->amcanbackward = false;
+	amroutine->amcanunique = false;
+	amroutine->amcanmulticol = true;
+	amroutine->amoptionalkey = true;
+	amroutine->amsearcharray = false;
+	amroutine->amsearchnulls = true;
+	amroutine->amstorage = true;
+	amroutine->amclusterable = true;
+	amroutine->ampredlocks = true;
+	amroutine->amcanparallel = false;
+	amroutine->amcaninclude = false;
+	amroutine->amkeytype = InvalidOid;
+
+	amroutine->ambuild = gistbuild;
+	amroutine->ambuildempty = gistbuildempty;
+	amroutine->aminsert = gistinsert;
+	amroutine->ambulkdelete = gistbulkdelete;
+	amroutine->amvacuumcleanup = gistvacuumcleanup;
+	amroutine->amcanreturn = gistcanreturn;
+	amroutine->amcostestimate = gistcostestimate;
+	amroutine->amoptions = gistoptions;
+	amroutine->amproperty = gistproperty;
+	amroutine->amvalidate = gistvalidate;
+	amroutine->ambeginscan = gistbeginscan;
+	amroutine->amrescan = gistrescan;
+	amroutine->amgettuple = gistgettuple;
+	amroutine->amgetbitmap = gistgetbitmap;
+	amroutine->amendscan = gistendscan;
+	amroutine->ammarkpos = NULL;
+	amroutine->amrestrpos = NULL;
+	amroutine->amestimateparallelscan = NULL;
+	amroutine->aminitparallelscan = NULL;
+	amroutine->amparallelrescan = NULL;
+
+	PG_RETURN_POINTER(amroutine);
+}
+
+/*
  * Create and return a temporary memory context for use by GiST. We
  * _always_ invoke user-provided methods in a temporary memory
  * context, so that memory leaks in those functions cannot cause
@@ -62,18 +114,15 @@ createTempGistContext(void)
 {
 	return AllocSetContextCreate(CurrentMemoryContext,
 								 "GiST temporary context",
-								 ALLOCSET_DEFAULT_MINSIZE,
-								 ALLOCSET_DEFAULT_INITSIZE,
-								 ALLOCSET_DEFAULT_MAXSIZE);
+								 ALLOCSET_DEFAULT_SIZES);
 }
 
 /*
  *	gistbuildempty() -- build an empty gist index in the initialization fork
  */
-Datum
-gistbuildempty(PG_FUNCTION_ARGS)
+void
+gistbuildempty(Relation index)
 {
-	Relation	index = (Relation) PG_GETARG_POINTER(0);
 	Buffer		buffer;
 
 	/* Initialize the root page */
@@ -89,8 +138,6 @@ gistbuildempty(PG_FUNCTION_ARGS)
 
 	/* Unlock and release the buffer */
 	UnlockReleaseBuffer(buffer);
-
-	PG_RETURN_VOID();
 }
 
 /*
@@ -99,31 +146,26 @@ gistbuildempty(PG_FUNCTION_ARGS)
  *	  This is the public interface routine for tuple insertion in GiSTs.
  *	  It doesn't do any work; just locks the relation and passes the buck.
  */
-Datum
-gistinsert(PG_FUNCTION_ARGS)
+bool
+gistinsert(Relation r, Datum *values, bool *isnull,
+		   ItemPointer ht_ctid, Relation heapRel,
+		   IndexUniqueCheck checkUnique,
+		   IndexInfo *indexInfo)
 {
-	Relation	r = (Relation) PG_GETARG_POINTER(0);
-	Datum	   *values = (Datum *) PG_GETARG_POINTER(1);
-	bool	   *isnull = (bool *) PG_GETARG_POINTER(2);
-	ItemPointer ht_ctid = (ItemPointer) PG_GETARG_POINTER(3);
-
-#ifdef NOT_USED
-	Relation	heapRel = (Relation) PG_GETARG_POINTER(4);
-	IndexUniqueCheck checkUnique = (IndexUniqueCheck) PG_GETARG_INT32(5);
-#endif
+	GISTSTATE  *giststate = (GISTSTATE *) indexInfo->ii_AmCache;
 	IndexTuple	itup;
-	GISTSTATE  *giststate;
 	MemoryContext oldCxt;
 
-	giststate = initGISTstate(r);
+	/* Initialize GISTSTATE cache if first call in this statement */
+	if (giststate == NULL)
+	{
+		oldCxt = MemoryContextSwitchTo(indexInfo->ii_Context);
+		giststate = initGISTstate(r);
+		giststate->tempCxt = createTempGistContext();
+		indexInfo->ii_AmCache = (void *) giststate;
+		MemoryContextSwitchTo(oldCxt);
+	}
 
-	/*
-	 * We use the giststate's scan context as temp context too.  This means
-	 * that any memory leaked by the support functions is not reclaimed until
-	 * end of insert.  In most cases, we aren't going to call the support
-	 * functions very many times before finishing the insert, so this seems
-	 * cheaper than resetting a temp context for each function call.
-	 */
 	oldCxt = MemoryContextSwitchTo(giststate->tempCxt);
 
 	itup = gistFormTuple(giststate, r,
@@ -134,9 +176,9 @@ gistinsert(PG_FUNCTION_ARGS)
 
 	/* cleanup */
 	MemoryContextSwitchTo(oldCxt);
-	freeGISTstate(giststate);
+	MemoryContextReset(giststate->tempCxt);
 
-	PG_RETURN_BOOL(false);
+	return false;
 }
 
 
@@ -298,6 +340,9 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 			GISTInitBuffer(ptr->buffer, (is_leaf) ? F_LEAF : 0);
 			ptr->page = BufferGetPage(ptr->buffer);
 			ptr->block.blkno = BufferGetBlockNumber(ptr->buffer);
+			PredicateLockPageSplit(rel,
+								   BufferGetBlockNumber(buffer),
+								   BufferGetBlockNumber(ptr->buffer));
 		}
 
 		/*
@@ -435,7 +480,7 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 
 		/* Write the WAL record */
 		if (RelationNeedsWAL(rel))
-			recptr = gistXLogSplit(rel->rd_node, blkno, is_leaf,
+			recptr = gistXLogSplit(is_leaf,
 								   dist, oldrlink, oldnsn, leftchildbuf,
 								   markfollowright);
 		else
@@ -462,18 +507,36 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 	else
 	{
 		/*
-		 * Enough space. We also get here if ntuples==0.
+		 * Enough space.  We always get here if ntup==0.
 		 */
 		START_CRIT_SECTION();
 
 		/*
-		 * While we delete only one tuple at once we could mix calls
-		 * PageIndexTupleDelete() here and PageIndexMultiDelete() in
-		 * gistRedoPageUpdateRecord()
+		 * Delete old tuple if any, then insert new tuple(s) if any.  If
+		 * possible, use the fast path of PageIndexTupleOverwrite.
 		 */
 		if (OffsetNumberIsValid(oldoffnum))
-			PageIndexTupleDelete(page, oldoffnum);
-		gistfillbuffer(page, itup, ntup, InvalidOffsetNumber);
+		{
+			if (ntup == 1)
+			{
+				/* One-for-one replacement, so use PageIndexTupleOverwrite */
+				if (!PageIndexTupleOverwrite(page, oldoffnum, (Item) *itup,
+											 IndexTupleSize(*itup)))
+					elog(ERROR, "failed to add item to index page in \"%s\"",
+						 RelationGetRelationName(rel));
+			}
+			else
+			{
+				/* Delete old, then append new tuple(s) to page */
+				PageIndexTupleDelete(page, oldoffnum);
+				gistfillbuffer(page, itup, ntup, InvalidOffsetNumber);
+			}
+		}
+		else
+		{
+			/* Just append new tuples at the end of the page */
+			gistfillbuffer(page, itup, ntup, InvalidOffsetNumber);
+		}
 
 		MarkBufferDirty(buffer);
 
@@ -491,7 +554,7 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 				ndeloffs = 1;
 			}
 
-			recptr = gistXLogUpdate(rel->rd_node, buffer,
+			recptr = gistXLogUpdate(buffer,
 									deloffs, ndeloffs, itup, ntup,
 									leftchildbuf);
 
@@ -583,7 +646,8 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace, GISTSTATE *giststate)
 		}
 
 		stack->page = (Page) BufferGetPage(stack->buffer);
-		stack->lsn = PageGetLSN(stack->page);
+		stack->lsn = xlocked ?
+			PageGetLSN(stack->page) : BufferGetLSNAtomic(stack->buffer);
 		Assert(!RelationNeedsWAL(state.r) || !XLogRecPtrIsInvalid(stack->lsn));
 
 		/*
@@ -833,7 +897,7 @@ gistFindPath(Relation r, BlockNumber child, OffsetNumber *downlinkoffnum)
 			break;
 		}
 
-		top->lsn = PageGetLSN(page);
+		top->lsn = BufferGetLSNAtomic(buffer);
 
 		/*
 		 * If F_FOLLOW_RIGHT is set, the page to the right doesn't have a
@@ -1113,7 +1177,7 @@ gistfixsplit(GISTInsertState *state, GISTSTATE *giststate)
  */
 static bool
 gistinserttuple(GISTInsertState *state, GISTInsertStack *stack,
-			  GISTSTATE *giststate, IndexTuple tuple, OffsetNumber oldoffnum)
+				GISTSTATE *giststate, IndexTuple tuple, OffsetNumber oldoffnum)
 {
 	return gistinserttuples(state, stack, giststate, &tuple, 1, oldoffnum,
 							InvalidBuffer, InvalidBuffer, false, false);
@@ -1154,6 +1218,12 @@ gistinserttuples(GISTInsertState *state, GISTInsertStack *stack,
 {
 	List	   *splitinfo;
 	bool		is_split;
+
+	/*
+	 * Check for any rw conflicts (in serializable isolation level) just
+	 * before we intend to modify the page
+	 */
+	CheckForSerializableConflictIn(state->r, NULL, stack->buffer);
 
 	/* Insert the tuple(s) to the page, splitting the page if necessary */
 	is_split = gistplacetopage(state->r, state->freespace, giststate,
@@ -1303,12 +1373,12 @@ gistSplit(Relation r,
 	if (len == 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-			errmsg("index row size %zu exceeds maximum %zu for index \"%s\"",
-				   IndexTupleSize(itup[0]), GiSTPageSize,
-				   RelationGetRelationName(r))));
+				 errmsg("index row size %zu exceeds maximum %zu for index \"%s\"",
+						IndexTupleSize(itup[0]), GiSTPageSize,
+						RelationGetRelationName(r))));
 
-	memset(v.spl_lisnull, TRUE, sizeof(bool) * giststate->tupdesc->natts);
-	memset(v.spl_risnull, TRUE, sizeof(bool) * giststate->tupdesc->natts);
+	memset(v.spl_lisnull, true, sizeof(bool) * giststate->tupdesc->natts);
+	memset(v.spl_risnull, true, sizeof(bool) * giststate->tupdesc->natts);
 	gistSplitByKey(r, page, itup, len, giststate, &v, 0);
 
 	/* form left and right vector */
@@ -1378,16 +1448,14 @@ initGISTstate(Relation index)
 	/* Create the memory context that will hold the GISTSTATE */
 	scanCxt = AllocSetContextCreate(CurrentMemoryContext,
 									"GiST scan context",
-									ALLOCSET_DEFAULT_MINSIZE,
-									ALLOCSET_DEFAULT_INITSIZE,
-									ALLOCSET_DEFAULT_MAXSIZE);
+									ALLOCSET_DEFAULT_SIZES);
 	oldCxt = MemoryContextSwitchTo(scanCxt);
 
 	/* Create and fill in the GISTSTATE */
 	giststate = (GISTSTATE *) palloc(sizeof(GISTSTATE));
 
 	giststate->scanCxt = scanCxt;
-	giststate->tempCxt = scanCxt;		/* caller must change this if needed */
+	giststate->tempCxt = scanCxt;	/* caller must change this if needed */
 	giststate->tupdesc = index->rd_att;
 
 	for (i = 0; i < index->rd_att->natts; i++)
@@ -1398,12 +1466,23 @@ initGISTstate(Relation index)
 		fmgr_info_copy(&(giststate->unionFn[i]),
 					   index_getprocinfo(index, i + 1, GIST_UNION_PROC),
 					   scanCxt);
-		fmgr_info_copy(&(giststate->compressFn[i]),
-					   index_getprocinfo(index, i + 1, GIST_COMPRESS_PROC),
-					   scanCxt);
-		fmgr_info_copy(&(giststate->decompressFn[i]),
-					   index_getprocinfo(index, i + 1, GIST_DECOMPRESS_PROC),
-					   scanCxt);
+
+		/* opclasses are not required to provide a Compress method */
+		if (OidIsValid(index_getprocid(index, i + 1, GIST_COMPRESS_PROC)))
+			fmgr_info_copy(&(giststate->compressFn[i]),
+						   index_getprocinfo(index, i + 1, GIST_COMPRESS_PROC),
+						   scanCxt);
+		else
+			giststate->compressFn[i].fn_oid = InvalidOid;
+
+		/* opclasses are not required to provide a Decompress method */
+		if (OidIsValid(index_getprocid(index, i + 1, GIST_DECOMPRESS_PROC)))
+			fmgr_info_copy(&(giststate->decompressFn[i]),
+						   index_getprocinfo(index, i + 1, GIST_DECOMPRESS_PROC),
+						   scanCxt);
+		else
+			giststate->decompressFn[i].fn_oid = InvalidOid;
+
 		fmgr_info_copy(&(giststate->penaltyFn[i]),
 					   index_getprocinfo(index, i + 1, GIST_PENALTY_PROC),
 					   scanCxt);
@@ -1413,10 +1492,11 @@ initGISTstate(Relation index)
 		fmgr_info_copy(&(giststate->equalFn[i]),
 					   index_getprocinfo(index, i + 1, GIST_EQUAL_PROC),
 					   scanCxt);
+
 		/* opclasses are not required to provide a Distance method */
 		if (OidIsValid(index_getprocid(index, i + 1, GIST_DISTANCE_PROC)))
 			fmgr_info_copy(&(giststate->distanceFn[i]),
-						 index_getprocinfo(index, i + 1, GIST_DISTANCE_PROC),
+						   index_getprocinfo(index, i + 1, GIST_DISTANCE_PROC),
 						   scanCxt);
 		else
 			giststate->distanceFn[i].fn_oid = InvalidOid;
@@ -1466,8 +1546,9 @@ static void
 gistvacuumpage(Relation rel, Page page, Buffer buffer)
 {
 	OffsetNumber deletable[MaxIndexTuplesPerPage];
-	int			 ndeletable = 0;
-	OffsetNumber offnum, maxoff;
+	int			ndeletable = 0;
+	OffsetNumber offnum,
+				maxoff;
 
 	Assert(GistPageIsLeaf(page));
 
@@ -1508,7 +1589,7 @@ gistvacuumpage(Relation rel, Page page, Buffer buffer)
 		{
 			XLogRecPtr	recptr;
 
-			recptr = gistXLogUpdate(rel->rd_node, buffer,
+			recptr = gistXLogUpdate(buffer,
 									deletable, ndeletable,
 									NULL, 0, InvalidBuffer);
 

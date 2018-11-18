@@ -3,7 +3,7 @@
  * pg_type.c
  *	  routines to support manipulation of the pg_type relation
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,7 +25,6 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
-#include "catalog/pg_type_fn.h"
 #include "commands/typecmds.h"
 #include "miscadmin.h"
 #include "parser/scansup.h"
@@ -79,7 +78,7 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	for (i = 0; i < Natts_pg_type; ++i)
 	{
 		nulls[i] = false;
-		values[i] = (Datum) NULL;		/* redundant, but safe */
+		values[i] = (Datum) NULL;	/* redundant, but safe */
 	}
 
 	/*
@@ -133,7 +132,7 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 		if (!OidIsValid(binary_upgrade_next_pg_type_oid))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			errmsg("pg_type OID value not set when in binary upgrade mode")));
+					 errmsg("pg_type OID value not set when in binary upgrade mode")));
 
 		HeapTupleSetOid(tup, binary_upgrade_next_pg_type_oid);
 		binary_upgrade_next_pg_type_oid = InvalidOid;
@@ -142,31 +141,19 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	/*
 	 * insert the tuple in the relation and get the tuple's oid.
 	 */
-	typoid = simple_heap_insert(pg_type_desc, tup);
-
-	CatalogUpdateIndexes(pg_type_desc, tup);
+	typoid = CatalogTupleInsert(pg_type_desc, tup);
 
 	/*
 	 * Create dependencies.  We can/must skip this in bootstrap mode.
 	 */
 	if (!IsBootstrapProcessingMode())
-		GenerateTypeDependencies(typeNamespace,
-								 typoid,
-								 InvalidOid,
-								 0,
-								 ownerId,
-								 F_SHELL_IN,
-								 F_SHELL_OUT,
-								 InvalidOid,
-								 InvalidOid,
-								 InvalidOid,
-								 InvalidOid,
-								 InvalidOid,
-								 InvalidOid,
-								 false,
-								 InvalidOid,
-								 InvalidOid,
+		GenerateTypeDependencies(typoid,
+								 (Form_pg_type) GETSTRUCT(tup),
 								 NULL,
+								 NULL,
+								 0,
+								 false,
+								 false,
 								 false);
 
 	/* Post creation hook for new shell type */
@@ -216,7 +203,7 @@ TypeCreate(Oid newTypeOid,
 		   bool isImplicitArray,
 		   Oid arrayType,
 		   Oid baseType,
-		   const char *defaultTypeValue,		/* human readable rep */
+		   const char *defaultTypeValue,	/* human readable rep */
 		   char *defaultTypeBin,	/* cooked rep */
 		   bool passedByValue,
 		   char alignment,
@@ -228,14 +215,15 @@ TypeCreate(Oid newTypeOid,
 {
 	Relation	pg_type_desc;
 	Oid			typeObjectId;
+	bool		isDependentType;
 	bool		rebuildDeps = false;
+	Acl		   *typacl;
 	HeapTuple	tup;
 	bool		nulls[Natts_pg_type];
 	bool		replaces[Natts_pg_type];
 	Datum		values[Natts_pg_type];
 	NameData	name;
 	int			i;
-	Acl		   *typacl = NULL;
 	ObjectAddress address;
 
 	/*
@@ -298,8 +286,8 @@ TypeCreate(Oid newTypeOid,
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-			   errmsg("internal size %d is invalid for passed-by-value type",
-					  internalSize)));
+					 errmsg("internal size %d is invalid for passed-by-value type",
+							internalSize)));
 	}
 	else
 	{
@@ -307,14 +295,14 @@ TypeCreate(Oid newTypeOid,
 		if (internalSize == -1 && !(alignment == 'i' || alignment == 'd'))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-			   errmsg("alignment \"%c\" is invalid for variable-length type",
-					  alignment)));
+					 errmsg("alignment \"%c\" is invalid for variable-length type",
+							alignment)));
 		/* cstring must have char alignment */
 		if (internalSize == -2 && !(alignment == 'c'))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-			   errmsg("alignment \"%c\" is invalid for variable-length type",
-					  alignment)));
+					 errmsg("alignment \"%c\" is invalid for variable-length type",
+							alignment)));
 	}
 
 	/* Only varlena types can be toasted */
@@ -322,6 +310,17 @@ TypeCreate(Oid newTypeOid,
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("fixed-size types must have storage PLAIN")));
+
+	/*
+	 * This is a dependent type if it's an implicitly-created array type, or
+	 * if it's a relation rowtype that's not a composite type.  For such types
+	 * we'll leave the ACL empty, and we'll skip creating some dependency
+	 * records because there will be a dependency already through the
+	 * depended-on type or relation.  (Caution: this is closely intertwined
+	 * with some behavior in GenerateTypeDependencies.)
+	 */
+	isDependentType = isImplicitArray ||
+		(OidIsValid(relationOid) && relationKind != RELKIND_COMPOSITE_TYPE);
 
 	/*
 	 * initialize arrays needed for heap_form_tuple or heap_modify_tuple
@@ -382,8 +381,14 @@ TypeCreate(Oid newTypeOid,
 	else
 		nulls[Anum_pg_type_typdefault - 1] = true;
 
-	typacl = get_user_default_acl(ACL_OBJECT_TYPE, ownerId,
-								  typeNamespace);
+	/*
+	 * Initialize the type's ACL, too.  But dependent types don't get one.
+	 */
+	if (isDependentType)
+		typacl = NULL;
+	else
+		typacl = get_user_default_acl(OBJECT_TYPE, ownerId,
+									  typeNamespace);
 	if (typacl != NULL)
 		values[Anum_pg_type_typacl - 1] = PointerGetDatum(typacl);
 	else
@@ -415,7 +420,7 @@ TypeCreate(Oid newTypeOid,
 		 * shell type must have been created by same owner
 		 */
 		if (((Form_pg_type) GETSTRUCT(tup))->typowner != ownerId)
-			aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TYPE, typeName);
+			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TYPE, typeName);
 
 		/* trouble if caller wanted to force the OID */
 		if (OidIsValid(newTypeOid))
@@ -430,7 +435,7 @@ TypeCreate(Oid newTypeOid,
 								nulls,
 								replaces);
 
-		simple_heap_update(pg_type_desc, &tup->t_self, tup);
+		CatalogTupleUpdate(pg_type_desc, &tup->t_self, tup);
 
 		typeObjectId = HeapTupleGetOid(tup);
 
@@ -458,35 +463,22 @@ TypeCreate(Oid newTypeOid,
 		}
 		/* else allow system to assign oid */
 
-		typeObjectId = simple_heap_insert(pg_type_desc, tup);
+		typeObjectId = CatalogTupleInsert(pg_type_desc, tup);
 	}
-
-	/* Update indexes */
-	CatalogUpdateIndexes(pg_type_desc, tup);
 
 	/*
 	 * Create dependencies.  We can/must skip this in bootstrap mode.
 	 */
 	if (!IsBootstrapProcessingMode())
-		GenerateTypeDependencies(typeNamespace,
-								 typeObjectId,
-								 relationOid,
-								 relationKind,
-								 ownerId,
-								 inputProcedure,
-								 outputProcedure,
-								 receiveProcedure,
-								 sendProcedure,
-								 typmodinProcedure,
-								 typmodoutProcedure,
-								 analyzeProcedure,
-								 elementType,
-								 isImplicitArray,
-								 baseType,
-								 typeCollation,
+		GenerateTypeDependencies(typeObjectId,
+								 (Form_pg_type) GETSTRUCT(tup),
 								 (defaultTypeBin ?
 								  stringToNode(defaultTypeBin) :
 								  NULL),
+								 typacl,
+								 relationKind,
+								 isImplicitArray,
+								 isDependentType,
 								 rebuildDeps);
 
 	/* Post creation hook for new type */
@@ -505,6 +497,17 @@ TypeCreate(Oid newTypeOid,
 /*
  * GenerateTypeDependencies: build the dependencies needed for a type
  *
+ * Most of what this function needs to know about the type is passed as the
+ * new pg_type row, typeForm.  But we can't get at the varlena fields through
+ * that, so defaultExpr and typacl are passed separately.  (typacl is really
+ * "Acl *", but we declare it "void *" to avoid including acl.h in pg_type.h.)
+ *
+ * relationKind and isImplicitArray aren't visible in the pg_type row either,
+ * so they're also passed separately.
+ *
+ * isDependentType is true if this is an implicit array or relation rowtype;
+ * that means it doesn't need its own dependencies on owner etc.
+ *
  * If rebuild is true, we remove existing dependencies and rebuild them
  * from scratch.  This is needed for ALTER TYPE, and also when replacing
  * a shell type.  We don't remove an existing extension dependency, though.
@@ -514,23 +517,13 @@ TypeCreate(Oid newTypeOid,
  * that type will become a member of the extension.)
  */
 void
-GenerateTypeDependencies(Oid typeNamespace,
-						 Oid typeObjectId,
-						 Oid relationOid,		/* only for relation rowtypes */
-						 char relationKind,		/* ditto */
-						 Oid owner,
-						 Oid inputProcedure,
-						 Oid outputProcedure,
-						 Oid receiveProcedure,
-						 Oid sendProcedure,
-						 Oid typmodinProcedure,
-						 Oid typmodoutProcedure,
-						 Oid analyzeProcedure,
-						 Oid elementType,
-						 bool isImplicitArray,
-						 Oid baseType,
-						 Oid typeCollation,
+GenerateTypeDependencies(Oid typeObjectId,
+						 Form_pg_type typeForm,
 						 Node *defaultExpr,
+						 void *typacl,
+						 char relationKind, /* only for relation rowtypes */
+						 bool isImplicitArray,
+						 bool isDependentType,
 						 bool rebuild)
 {
 	ObjectAddress myself,
@@ -548,79 +541,80 @@ GenerateTypeDependencies(Oid typeNamespace,
 	myself.objectSubId = 0;
 
 	/*
-	 * Make dependencies on namespace, owner, extension.
+	 * Make dependencies on namespace, owner, ACL, extension.
 	 *
-	 * For a relation rowtype (that's not a composite type), we should skip
-	 * these because we'll depend on them indirectly through the pg_class
-	 * entry.  Likewise, skip for implicit arrays since we'll depend on them
-	 * through the element type.
+	 * Skip these for a dependent type, since it will have such dependencies
+	 * indirectly through its depended-on type or relation.
 	 */
-	if ((!OidIsValid(relationOid) || relationKind == RELKIND_COMPOSITE_TYPE) &&
-		!isImplicitArray)
+	if (!isDependentType)
 	{
 		referenced.classId = NamespaceRelationId;
-		referenced.objectId = typeNamespace;
+		referenced.objectId = typeForm->typnamespace;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 
-		recordDependencyOnOwner(TypeRelationId, typeObjectId, owner);
+		recordDependencyOnOwner(TypeRelationId, typeObjectId,
+								typeForm->typowner);
+
+		recordDependencyOnNewAcl(TypeRelationId, typeObjectId, 0,
+								 typeForm->typowner, typacl);
 
 		recordDependencyOnCurrentExtension(&myself, rebuild);
 	}
 
 	/* Normal dependencies on the I/O functions */
-	if (OidIsValid(inputProcedure))
+	if (OidIsValid(typeForm->typinput))
 	{
 		referenced.classId = ProcedureRelationId;
-		referenced.objectId = inputProcedure;
+		referenced.objectId = typeForm->typinput;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
 
-	if (OidIsValid(outputProcedure))
+	if (OidIsValid(typeForm->typoutput))
 	{
 		referenced.classId = ProcedureRelationId;
-		referenced.objectId = outputProcedure;
+		referenced.objectId = typeForm->typoutput;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
 
-	if (OidIsValid(receiveProcedure))
+	if (OidIsValid(typeForm->typreceive))
 	{
 		referenced.classId = ProcedureRelationId;
-		referenced.objectId = receiveProcedure;
+		referenced.objectId = typeForm->typreceive;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
 
-	if (OidIsValid(sendProcedure))
+	if (OidIsValid(typeForm->typsend))
 	{
 		referenced.classId = ProcedureRelationId;
-		referenced.objectId = sendProcedure;
+		referenced.objectId = typeForm->typsend;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
 
-	if (OidIsValid(typmodinProcedure))
+	if (OidIsValid(typeForm->typmodin))
 	{
 		referenced.classId = ProcedureRelationId;
-		referenced.objectId = typmodinProcedure;
+		referenced.objectId = typeForm->typmodin;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
 
-	if (OidIsValid(typmodoutProcedure))
+	if (OidIsValid(typeForm->typmodout))
 	{
 		referenced.classId = ProcedureRelationId;
-		referenced.objectId = typmodoutProcedure;
+		referenced.objectId = typeForm->typmodout;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
 
-	if (OidIsValid(analyzeProcedure))
+	if (OidIsValid(typeForm->typanalyze))
 	{
 		referenced.classId = ProcedureRelationId;
-		referenced.objectId = analyzeProcedure;
+		referenced.objectId = typeForm->typanalyze;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
@@ -634,10 +628,10 @@ GenerateTypeDependencies(Oid typeNamespace,
 	 * relation is, and not otherwise. And in the latter, of course we get the
 	 * opposite effect.
 	 */
-	if (OidIsValid(relationOid))
+	if (OidIsValid(typeForm->typrelid))
 	{
 		referenced.classId = RelationRelationId;
-		referenced.objectId = relationOid;
+		referenced.objectId = typeForm->typrelid;
 		referenced.objectSubId = 0;
 
 		if (relationKind != RELKIND_COMPOSITE_TYPE)
@@ -651,30 +645,31 @@ GenerateTypeDependencies(Oid typeNamespace,
 	 * dependent on the element type.  Otherwise, if it has an element type,
 	 * the dependency is a normal one.
 	 */
-	if (OidIsValid(elementType))
+	if (OidIsValid(typeForm->typelem))
 	{
 		referenced.classId = TypeRelationId;
-		referenced.objectId = elementType;
+		referenced.objectId = typeForm->typelem;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced,
-				  isImplicitArray ? DEPENDENCY_INTERNAL : DEPENDENCY_NORMAL);
+						   isImplicitArray ? DEPENDENCY_INTERNAL : DEPENDENCY_NORMAL);
 	}
 
 	/* Normal dependency from a domain to its base type. */
-	if (OidIsValid(baseType))
+	if (OidIsValid(typeForm->typbasetype))
 	{
 		referenced.classId = TypeRelationId;
-		referenced.objectId = baseType;
+		referenced.objectId = typeForm->typbasetype;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
 
 	/* Normal dependency from a domain to its collation. */
 	/* We know the default collation is pinned, so don't bother recording it */
-	if (OidIsValid(typeCollation) && typeCollation != DEFAULT_COLLATION_OID)
+	if (OidIsValid(typeForm->typcollation) &&
+		typeForm->typcollation != DEFAULT_COLLATION_OID)
 	{
 		referenced.classId = CollationRelationId;
-		referenced.objectId = typeCollation;
+		referenced.objectId = typeForm->typcollation;
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
@@ -700,6 +695,7 @@ RenameTypeInternal(Oid typeOid, const char *newTypeName, Oid typeNamespace)
 	HeapTuple	tuple;
 	Form_pg_type typ;
 	Oid			arrayOid;
+	Oid			oldTypeOid;
 
 	pg_type_desc = heap_open(TypeRelationId, RowExclusiveLock);
 
@@ -713,29 +709,45 @@ RenameTypeInternal(Oid typeOid, const char *newTypeName, Oid typeNamespace)
 
 	arrayOid = typ->typarray;
 
-	/* Just to give a more friendly error than unique-index violation */
-	if (SearchSysCacheExists2(TYPENAMENSP,
-							  CStringGetDatum(newTypeName),
-							  ObjectIdGetDatum(typeNamespace)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_OBJECT),
-				 errmsg("type \"%s\" already exists", newTypeName)));
+	/* Check for a conflicting type name. */
+	oldTypeOid = GetSysCacheOid2(TYPENAMENSP,
+								 CStringGetDatum(newTypeName),
+								 ObjectIdGetDatum(typeNamespace));
+
+	/*
+	 * If there is one, see if it's an autogenerated array type, and if so
+	 * rename it out of the way.  (But we must skip that for a shell type
+	 * because moveArrayTypeName will do the wrong thing in that case.)
+	 * Otherwise, we can at least give a more friendly error than unique-index
+	 * violation.
+	 */
+	if (OidIsValid(oldTypeOid))
+	{
+		if (get_typisdefined(oldTypeOid) &&
+			moveArrayTypeName(oldTypeOid, newTypeName, typeNamespace))
+			 /* successfully dodged the problem */ ;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("type \"%s\" already exists", newTypeName)));
+	}
 
 	/* OK, do the rename --- tuple is a copy, so OK to scribble on it */
 	namestrcpy(&(typ->typname), newTypeName);
 
-	simple_heap_update(pg_type_desc, &tuple->t_self, tuple);
-
-	/* update the system catalog indexes */
-	CatalogUpdateIndexes(pg_type_desc, tuple);
+	CatalogTupleUpdate(pg_type_desc, &tuple->t_self, tuple);
 
 	InvokeObjectPostAlterHook(TypeRelationId, typeOid, 0);
 
 	heap_freetuple(tuple);
 	heap_close(pg_type_desc, RowExclusiveLock);
 
-	/* If the type has an array type, recurse to handle that */
-	if (OidIsValid(arrayOid))
+	/*
+	 * If the type has an array type, recurse to handle that.  But we don't
+	 * need to do anything more if we already renamed that array type above
+	 * (which would happen when, eg, renaming "foo" to "_foo").
+	 */
+	if (OidIsValid(arrayOid) && arrayOid != oldTypeOid)
 	{
 		char	   *arrname = makeArrayTypeName(newTypeName, typeNamespace);
 
@@ -809,9 +821,9 @@ makeArrayTypeName(const char *typeName, Oid typeNamespace)
  * determine the new type's own array type name; else the latter will
  * certainly pick the same name.
  *
- * Returns TRUE if successfully moved the type, FALSE if not.
+ * Returns true if successfully moved the type, false if not.
  *
- * We also return TRUE if the given type is a shell type.  In this case
+ * We also return true if the given type is a shell type.  In this case
  * the type has not been renamed out of the way, but nonetheless it can
  * be expected that TypeCreate will succeed.  This behavior is convenient
  * for most callers --- those that need to distinguish the shell-type case

@@ -9,16 +9,16 @@ VACUUM;
 \a\t
 SELECT relname, relhasindex
    FROM pg_class c LEFT JOIN pg_namespace n ON n.oid = relnamespace
-   WHERE relkind = 'r' AND (nspname ~ '^pg_temp_') IS NOT TRUE
+   WHERE relkind IN ('r', 'p') AND (nspname ~ '^pg_temp_') IS NOT TRUE
    ORDER BY relname;
 a|f
 a_star|f
-abstime_tbl|f
 aggtest|f
 array_index_op_test|t
 array_op_test|f
 b|f
 b_star|f
+bit_defaults|f
 box_tbl|f
 bprime|f
 bt_f8_heap|t
@@ -38,6 +38,7 @@ d_star|f
 date_tbl|f
 default_tbl|f
 defaultexpr_tbl|f
+delete_test_table|t
 dept|f
 dupindexcols|t
 e_star|f
@@ -62,12 +63,25 @@ int2_tbl|f
 int4_tbl|f
 int8_tbl|f
 interval_tbl|f
+invalid_check_con|f
+invalid_check_con_child|f
 iportaltest|f
 kd_point_tbl|t
 line_tbl|f
 log_table|f
 lseg_tbl|f
 main_table|f
+mlparted|f
+mlparted1|f
+mlparted11|f
+mlparted12|f
+mlparted2|f
+mlparted3|f
+mlparted4|f
+mlparted_def|f
+mlparted_def1|f
+mlparted_def2|f
+mlparted_defd|f
 money_data|f
 num_data|f
 num_exp_add|t
@@ -84,6 +98,9 @@ onek|t
 onek2|t
 path_tbl|f
 person|f
+persons|f
+persons2|t
+persons3|t
 pg_aggregate|t
 pg_am|t
 pg_amop|t
@@ -110,6 +127,7 @@ pg_foreign_server|t
 pg_foreign_table|t
 pg_index|t
 pg_inherits|t
+pg_init_privs|t
 pg_language|t
 pg_largeobject|t
 pg_largeobject_metadata|t
@@ -117,17 +135,24 @@ pg_namespace|t
 pg_opclass|t
 pg_operator|t
 pg_opfamily|t
+pg_partitioned_table|t
 pg_pltemplate|t
 pg_policy|t
 pg_proc|t
+pg_publication|t
+pg_publication_rel|t
 pg_range|t
 pg_replication_origin|t
 pg_rewrite|t
 pg_seclabel|t
+pg_sequence|t
 pg_shdepend|t
 pg_shdescription|t
 pg_shseclabel|t
 pg_statistic|t
+pg_statistic_ext|t
+pg_subscription|t
+pg_subscription_rel|t
 pg_tablespace|t
 pg_transform|t
 pg_trigger|t
@@ -140,11 +165,14 @@ pg_type|t
 pg_user_mapping|t
 point_tbl|t
 polygon_tbl|t
+quad_box_tbl|t
 quad_point_tbl|t
+quad_poly_tbl|t
+quad_poly_tbl_ord_seq1|f
+quad_poly_tbl_ord_seq2|f
 radix_text_tbl|t
 ramp|f
 real_city|f
-reltime_tbl|f
 road|t
 shighway|t
 slow_emp4000|f
@@ -157,6 +185,12 @@ sql_sizing|f
 sql_sizing_profiles|f
 stud_emp|f
 student|f
+tbl_include_box|t
+tbl_include_box_pk|f
+tbl_include_pk|t
+tbl_include_reg|t
+tbl_include_unique1|t
+tbl_include_unique2|f
 tenk1|t
 tenk2|t
 test_range_excl|t
@@ -169,7 +203,6 @@ time_tbl|f
 timestamp_tbl|f
 timestamptz_tbl|f
 timetz_tbl|f
-tinterval_tbl|f
 varchar_tbl|f
 -- restore normal output mode
 \a\t

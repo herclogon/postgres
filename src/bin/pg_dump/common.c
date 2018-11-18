@@ -4,7 +4,7 @@
  *	Catalog routines used by pg_dump; long ago these were shared
  *	by another dump tool, but not anymore.
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,7 +21,8 @@
 
 #include <ctype.h>
 
-#include "catalog/pg_class.h"
+#include "catalog/pg_class_d.h"
+#include "fe_utils/string_utils.h"
 
 
 /*
@@ -40,40 +41,44 @@ static int	numCatalogIds = 0;
 
 /*
  * These variables are static to avoid the notational cruft of having to pass
- * them into findTableByOid() and friends.  For each of these arrays, we
- * build a sorted-by-OID index array immediately after it's built, and then
- * we use binary search in findTableByOid() and friends.  (qsort'ing the base
- * arrays themselves would be simpler, but it doesn't work because pg_dump.c
- * may have already established pointers between items.)
+ * them into findTableByOid() and friends.  For each of these arrays, we build
+ * a sorted-by-OID index array immediately after the objects are fetched,
+ * and then we use binary search in findTableByOid() and friends.  (qsort'ing
+ * the object arrays themselves would be simpler, but it doesn't work because
+ * pg_dump.c may have already established pointers between items.)
  */
-static TableInfo *tblinfo;
-static TypeInfo *typinfo;
-static FuncInfo *funinfo;
-static OprInfo *oprinfo;
-static NamespaceInfo *nspinfo;
-static int	numTables;
-static int	numTypes;
-static int	numFuncs;
-static int	numOperators;
-static int	numCollations;
-static int	numNamespaces;
 static DumpableObject **tblinfoindex;
 static DumpableObject **typinfoindex;
 static DumpableObject **funinfoindex;
 static DumpableObject **oprinfoindex;
 static DumpableObject **collinfoindex;
 static DumpableObject **nspinfoindex;
+static DumpableObject **extinfoindex;
+static int	numTables;
+static int	numTypes;
+static int	numFuncs;
+static int	numOperators;
+static int	numCollations;
+static int	numNamespaces;
+static int	numExtensions;
 
+/* This is an array of object identities, not actual DumpableObjects */
+static ExtensionMemberId *extmembers;
+static int	numextmembers;
 
-static void flagInhTables(TableInfo *tbinfo, int numTables,
+static void flagInhTables(Archive *fout, TableInfo *tbinfo, int numTables,
 			  InhInfo *inhinfo, int numInherits);
+static void flagInhIndexes(Archive *fout, TableInfo *tblinfo, int numTables);
 static void flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables);
 static DumpableObject **buildIndexArray(void *objArray, int numObjs,
 				Size objSize);
 static int	DOCatalogIdCompare(const void *p1, const void *p2);
+static int	ExtensionMemberIdCompare(const void *p1, const void *p2);
 static void findParentsByOid(TableInfo *self,
 				 InhInfo *inhinfo, int numInherits);
 static int	strInArray(const char *pattern, char **arr, int arr_size);
+static IndxInfo *findIndexByOid(Oid oid, DumpableObject **idxinfoindex,
+			   int numIndexes);
 
 
 /*
@@ -81,18 +86,23 @@ static int	strInArray(const char *pattern, char **arr, int arr_size);
  *	  Collect information about all potentially dumpable objects
  */
 TableInfo *
-getSchemaData(Archive *fout, DumpOptions *dopt, int *numTablesPtr)
+getSchemaData(Archive *fout, int *numTablesPtr)
 {
+	TableInfo  *tblinfo;
+	TypeInfo   *typinfo;
+	FuncInfo   *funinfo;
+	OprInfo    *oprinfo;
+	CollInfo   *collinfo;
+	NamespaceInfo *nspinfo;
 	ExtensionInfo *extinfo;
 	InhInfo    *inhinfo;
-	CollInfo   *collinfo;
-	int			numExtensions;
 	int			numAggregates;
 	int			numInherits;
 	int			numRules;
 	int			numProcLangs;
 	int			numCasts;
 	int			numTransforms;
+	int			numAccessMethods;
 	int			numOpclasses;
 	int			numOpfamilies;
 	int			numConversions;
@@ -104,6 +114,20 @@ getSchemaData(Archive *fout, DumpOptions *dopt, int *numTablesPtr)
 	int			numForeignServers;
 	int			numDefaultACLs;
 	int			numEventTriggers;
+
+	/*
+	 * We must read extensions and extension membership info first, because
+	 * extension membership needs to be consultable during decisions about
+	 * whether other objects are to be dumped.
+	 */
+	if (g_verbose)
+		write_msg(NULL, "reading extensions\n");
+	extinfo = getExtensions(fout, &numExtensions);
+	extinfoindex = buildIndexArray(extinfo, numExtensions, sizeof(ExtensionInfo));
+
+	if (g_verbose)
+		write_msg(NULL, "identifying extension members\n");
+	getExtensionMembership(fout, extinfo, numExtensions);
 
 	if (g_verbose)
 		write_msg(NULL, "reading schemas\n");
@@ -118,19 +142,15 @@ getSchemaData(Archive *fout, DumpOptions *dopt, int *numTablesPtr)
 	 */
 	if (g_verbose)
 		write_msg(NULL, "reading user-defined tables\n");
-	tblinfo = getTables(fout, dopt, &numTables);
+	tblinfo = getTables(fout, &numTables);
 	tblinfoindex = buildIndexArray(tblinfo, numTables, sizeof(TableInfo));
 
 	/* Do this after we've built tblinfoindex */
 	getOwnedSeqs(fout, tblinfo, numTables);
 
 	if (g_verbose)
-		write_msg(NULL, "reading extensions\n");
-	extinfo = getExtensions(fout, dopt, &numExtensions);
-
-	if (g_verbose)
 		write_msg(NULL, "reading user-defined functions\n");
-	funinfo = getFuncs(fout, dopt, &numFuncs);
+	funinfo = getFuncs(fout, &numFuncs);
 	funinfoindex = buildIndexArray(funinfo, numFuncs, sizeof(FuncInfo));
 
 	/* this must be after getTables and getFuncs */
@@ -146,12 +166,16 @@ getSchemaData(Archive *fout, DumpOptions *dopt, int *numTablesPtr)
 
 	if (g_verbose)
 		write_msg(NULL, "reading user-defined aggregate functions\n");
-	getAggregates(fout, dopt, &numAggregates);
+	getAggregates(fout, &numAggregates);
 
 	if (g_verbose)
 		write_msg(NULL, "reading user-defined operators\n");
 	oprinfo = getOperators(fout, &numOperators);
 	oprinfoindex = buildIndexArray(oprinfo, numOperators, sizeof(OprInfo));
+
+	if (g_verbose)
+		write_msg(NULL, "reading user-defined access methods\n");
+	getAccessMethods(fout, &numAccessMethods);
 
 	if (g_verbose)
 		write_msg(NULL, "reading user-defined operator classes\n");
@@ -187,7 +211,7 @@ getSchemaData(Archive *fout, DumpOptions *dopt, int *numTablesPtr)
 
 	if (g_verbose)
 		write_msg(NULL, "reading default privileges\n");
-	getDefaultACLs(fout, dopt, &numDefaultACLs);
+	getDefaultACLs(fout, &numDefaultACLs);
 
 	if (g_verbose)
 		write_msg(NULL, "reading user-defined collations\n");
@@ -200,7 +224,7 @@ getSchemaData(Archive *fout, DumpOptions *dopt, int *numTablesPtr)
 
 	if (g_verbose)
 		write_msg(NULL, "reading type casts\n");
-	getCasts(fout, dopt, &numCasts);
+	getCasts(fout, &numCasts);
 
 	if (g_verbose)
 		write_msg(NULL, "reading transforms\n");
@@ -214,31 +238,35 @@ getSchemaData(Archive *fout, DumpOptions *dopt, int *numTablesPtr)
 		write_msg(NULL, "reading event triggers\n");
 	getEventTriggers(fout, &numEventTriggers);
 
-	/*
-	 * Identify extension member objects and mark them as not to be dumped.
-	 * This must happen after reading all objects that can be direct members
-	 * of extensions, but before we begin to process table subsidiary objects.
-	 */
+	/* Identify extension configuration tables that should be dumped */
 	if (g_verbose)
-		write_msg(NULL, "finding extension members\n");
-	getExtensionMembership(fout, dopt, extinfo, numExtensions);
+		write_msg(NULL, "finding extension tables\n");
+	processExtensionTables(fout, extinfo, numExtensions);
 
 	/* Link tables to parents, mark parents of target tables interesting */
 	if (g_verbose)
 		write_msg(NULL, "finding inheritance relationships\n");
-	flagInhTables(tblinfo, numTables, inhinfo, numInherits);
+	flagInhTables(fout, tblinfo, numTables, inhinfo, numInherits);
 
 	if (g_verbose)
 		write_msg(NULL, "reading column info for interesting tables\n");
-	getTableAttrs(fout, dopt, tblinfo, numTables);
+	getTableAttrs(fout, tblinfo, numTables);
 
 	if (g_verbose)
 		write_msg(NULL, "flagging inherited columns in subtables\n");
-	flagInhAttrs(dopt, tblinfo, numTables);
+	flagInhAttrs(fout->dopt, tblinfo, numTables);
 
 	if (g_verbose)
 		write_msg(NULL, "reading indexes\n");
 	getIndexes(fout, tblinfo, numTables);
+
+	if (g_verbose)
+		write_msg(NULL, "flagging indexes in partitioned tables\n");
+	flagInhIndexes(fout, tblinfo, numTables);
+
+	if (g_verbose)
+		write_msg(NULL, "reading extended statistics\n");
+	getExtendedStatistics(fout);
 
 	if (g_verbose)
 		write_msg(NULL, "reading constraints\n");
@@ -256,13 +284,25 @@ getSchemaData(Archive *fout, DumpOptions *dopt, int *numTablesPtr)
 		write_msg(NULL, "reading policies\n");
 	getPolicies(fout, tblinfo, numTables);
 
+	if (g_verbose)
+		write_msg(NULL, "reading publications\n");
+	getPublications(fout);
+
+	if (g_verbose)
+		write_msg(NULL, "reading publication membership\n");
+	getPublicationTables(fout, tblinfo, numTables);
+
+	if (g_verbose)
+		write_msg(NULL, "reading subscriptions\n");
+	getSubscriptions(fout);
+
 	*numTablesPtr = numTables;
 	return tblinfo;
 }
 
 /* flagInhTables -
- *	 Fill in parent link fields of every target table, and mark
- *	 parents of target tables as interesting
+ *	 Fill in parent link fields of tables for which we need that information,
+ *	 and mark parents of target tables as interesting
  *
  * Note that only direct ancestors of targets are marked interesting.
  * This is sufficient; we don't much care whether they inherited their
@@ -271,35 +311,154 @@ getSchemaData(Archive *fout, DumpOptions *dopt, int *numTablesPtr)
  * modifies tblinfo
  */
 static void
-flagInhTables(TableInfo *tblinfo, int numTables,
+flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 			  InhInfo *inhinfo, int numInherits)
 {
+	DumpOptions *dopt = fout->dopt;
 	int			i,
 				j;
-	int			numParents;
-	TableInfo **parents;
 
 	for (i = 0; i < numTables; i++)
 	{
+		bool		find_parents = true;
+		bool		mark_parents = true;
+
 		/* Some kinds never have parents */
 		if (tblinfo[i].relkind == RELKIND_SEQUENCE ||
 			tblinfo[i].relkind == RELKIND_VIEW ||
 			tblinfo[i].relkind == RELKIND_MATVIEW)
 			continue;
 
-		/* Don't bother computing anything for non-target tables, either */
+		/*
+		 * Normally, we don't bother computing anything for non-target tables,
+		 * but if load-via-partition-root is specified, we gather information
+		 * on every partition in the system so that getRootTableInfo can trace
+		 * from any given to leaf partition all the way up to the root.  (We
+		 * don't need to mark them as interesting for getTableAttrs, though.)
+		 */
 		if (!tblinfo[i].dobj.dump)
+		{
+			mark_parents = false;
+
+			if (!dopt->load_via_partition_root ||
+				!tblinfo[i].ispartition)
+				find_parents = false;
+		}
+
+		/* If needed, find all the immediate parent tables. */
+		if (find_parents)
+			findParentsByOid(&tblinfo[i], inhinfo, numInherits);
+
+		/*
+		 * If needed, mark the parents as interesting for getTableAttrs and
+		 * getIndexes.
+		 */
+		if (mark_parents)
+		{
+			int			numParents = tblinfo[i].numParents;
+			TableInfo **parents = tblinfo[i].parents;
+
+			for (j = 0; j < numParents; j++)
+				parents[j]->interesting = true;
+		}
+	}
+}
+
+/*
+ * flagInhIndexes -
+ *	 Create AttachIndexInfo objects for partitioned indexes, and add
+ *	 appropriate dependency links.
+ */
+static void
+flagInhIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
+{
+	int			i,
+				j,
+				k;
+	DumpableObject ***parentIndexArray;
+
+	parentIndexArray = (DumpableObject ***)
+		pg_malloc0(getMaxDumpId() * sizeof(DumpableObject **));
+
+	for (i = 0; i < numTables; i++)
+	{
+		TableInfo  *parenttbl;
+		IndexAttachInfo *attachinfo;
+
+		if (!tblinfo[i].ispartition || tblinfo[i].numParents == 0)
 			continue;
 
-		/* Find all the immediate parent tables */
-		findParentsByOid(&tblinfo[i], inhinfo, numInherits);
+		Assert(tblinfo[i].numParents == 1);
+		parenttbl = tblinfo[i].parents[0];
 
-		/* Mark the parents as interesting for getTableAttrs */
-		numParents = tblinfo[i].numParents;
-		parents = tblinfo[i].parents;
-		for (j = 0; j < numParents; j++)
-			parents[j]->interesting = true;
+		/*
+		 * We need access to each parent table's index list, but there is no
+		 * index to cover them outside of this function.  To avoid having to
+		 * sort every parent table's indexes each time we come across each of
+		 * its partitions, create an indexed array for each parent the first
+		 * time it is required.
+		 */
+		if (parentIndexArray[parenttbl->dobj.dumpId] == NULL)
+			parentIndexArray[parenttbl->dobj.dumpId] =
+				buildIndexArray(parenttbl->indexes,
+								parenttbl->numIndexes,
+								sizeof(IndxInfo));
+
+		attachinfo = (IndexAttachInfo *)
+			pg_malloc0(tblinfo[i].numIndexes * sizeof(IndexAttachInfo));
+		for (j = 0, k = 0; j < tblinfo[i].numIndexes; j++)
+		{
+			IndxInfo   *index = &(tblinfo[i].indexes[j]);
+			IndxInfo   *parentidx;
+
+			if (index->parentidx == 0)
+				continue;
+
+			parentidx = findIndexByOid(index->parentidx,
+									   parentIndexArray[parenttbl->dobj.dumpId],
+									   parenttbl->numIndexes);
+			if (parentidx == NULL)
+				continue;
+
+			attachinfo[k].dobj.objType = DO_INDEX_ATTACH;
+			attachinfo[k].dobj.catId.tableoid = 0;
+			attachinfo[k].dobj.catId.oid = 0;
+			AssignDumpId(&attachinfo[k].dobj);
+			attachinfo[k].dobj.name = pg_strdup(index->dobj.name);
+			attachinfo[k].dobj.namespace = index->indextable->dobj.namespace;
+			attachinfo[k].parentIdx = parentidx;
+			attachinfo[k].partitionIdx = index;
+
+			/*
+			 * We must state the DO_INDEX_ATTACH object's dependencies
+			 * explicitly, since it will not match anything in pg_depend.
+			 *
+			 * Give it dependencies on both the partition index and the parent
+			 * index, so that it will not be executed till both of those
+			 * exist.  (There's no need to care what order those are created
+			 * in.)
+			 *
+			 * In addition, give it dependencies on the indexes' underlying
+			 * tables.  This does nothing of great value so far as serial
+			 * restore ordering goes, but it ensures that a parallel restore
+			 * will not try to run the ATTACH concurrently with other
+			 * operations on those tables.
+			 */
+			addObjectDependency(&attachinfo[k].dobj, index->dobj.dumpId);
+			addObjectDependency(&attachinfo[k].dobj, parentidx->dobj.dumpId);
+			addObjectDependency(&attachinfo[k].dobj,
+								index->indextable->dobj.dumpId);
+			addObjectDependency(&attachinfo[k].dobj,
+								parentidx->indextable->dobj.dumpId);
+
+			k++;
+		}
 	}
+
+	for (i = 0; i < numTables; i++)
+		if (parentIndexArray[i])
+			pg_free(parentIndexArray[i]);
+	pg_free(parentIndexArray);
 }
 
 /* flagInhAttrs -
@@ -426,7 +585,7 @@ AssignDumpId(DumpableObject *dobj)
 	dobj->dumpId = ++lastDumpId;
 	dobj->name = NULL;			/* must be set later */
 	dobj->namespace = NULL;		/* may be set later */
-	dobj->dump = true;			/* default assumption */
+	dobj->dump = DUMP_COMPONENT_ALL;	/* default assumption */
 	dobj->ext_member = false;	/* default assumption */
 	dobj->dependencies = NULL;
 	dobj->nDeps = 0;
@@ -764,6 +923,105 @@ findNamespaceByOid(Oid oid)
 	return (NamespaceInfo *) findObjectByOid(oid, nspinfoindex, numNamespaces);
 }
 
+/*
+ * findExtensionByOid
+ *	  finds the entry (in extinfo) of the extension with the given oid
+ *	  returns NULL if not found
+ */
+ExtensionInfo *
+findExtensionByOid(Oid oid)
+{
+	return (ExtensionInfo *) findObjectByOid(oid, extinfoindex, numExtensions);
+}
+
+/*
+ * findIndexByOid
+ *		find the entry of the index with the given oid
+ *
+ * This one's signature is different from the previous ones because we lack a
+ * global array of all indexes, so caller must pass their array as argument.
+ */
+static IndxInfo *
+findIndexByOid(Oid oid, DumpableObject **idxinfoindex, int numIndexes)
+{
+	return (IndxInfo *) findObjectByOid(oid, idxinfoindex, numIndexes);
+}
+
+/*
+ * setExtensionMembership
+ *	  accept and save data about which objects belong to extensions
+ */
+void
+setExtensionMembership(ExtensionMemberId *extmems, int nextmems)
+{
+	/* Sort array in preparation for binary searches */
+	if (nextmems > 1)
+		qsort((void *) extmems, nextmems, sizeof(ExtensionMemberId),
+			  ExtensionMemberIdCompare);
+	/* And save */
+	extmembers = extmems;
+	numextmembers = nextmems;
+}
+
+/*
+ * findOwningExtension
+ *	  return owning extension for specified catalog ID, or NULL if none
+ */
+ExtensionInfo *
+findOwningExtension(CatalogId catalogId)
+{
+	ExtensionMemberId *low;
+	ExtensionMemberId *high;
+
+	/*
+	 * We could use bsearch() here, but the notational cruft of calling
+	 * bsearch is nearly as bad as doing it ourselves; and the generalized
+	 * bsearch function is noticeably slower as well.
+	 */
+	if (numextmembers <= 0)
+		return NULL;
+	low = extmembers;
+	high = extmembers + (numextmembers - 1);
+	while (low <= high)
+	{
+		ExtensionMemberId *middle;
+		int			difference;
+
+		middle = low + (high - low) / 2;
+		/* comparison must match ExtensionMemberIdCompare, below */
+		difference = oidcmp(middle->catId.oid, catalogId.oid);
+		if (difference == 0)
+			difference = oidcmp(middle->catId.tableoid, catalogId.tableoid);
+		if (difference == 0)
+			return middle->ext;
+		else if (difference < 0)
+			low = middle + 1;
+		else
+			high = middle - 1;
+	}
+	return NULL;
+}
+
+/*
+ * qsort comparator for ExtensionMemberIds
+ */
+static int
+ExtensionMemberIdCompare(const void *p1, const void *p2)
+{
+	const ExtensionMemberId *obj1 = (const ExtensionMemberId *) p1;
+	const ExtensionMemberId *obj2 = (const ExtensionMemberId *) p2;
+	int			cmpval;
+
+	/*
+	 * Compare OID first since it's usually unique, whereas there will only be
+	 * a few distinct values of tableoid.
+	 */
+	cmpval = oidcmp(obj1->catId.oid, obj2->catId.oid);
+	if (cmpval == 0)
+		cmpval = oidcmp(obj1->catId.tableoid, obj2->catId.tableoid);
+	return cmpval;
+}
+
 
 /*
  * findParentsByOid
@@ -888,38 +1146,4 @@ strInArray(const char *pattern, char **arr, int arr_size)
 			return i;
 	}
 	return -1;
-}
-
-
-/*
- * Support for simple list operations
- */
-
-void
-simple_oid_list_append(SimpleOidList *list, Oid val)
-{
-	SimpleOidListCell *cell;
-
-	cell = (SimpleOidListCell *) pg_malloc(sizeof(SimpleOidListCell));
-	cell->next = NULL;
-	cell->val = val;
-
-	if (list->tail)
-		list->tail->next = cell;
-	else
-		list->head = cell;
-	list->tail = cell;
-}
-
-bool
-simple_oid_list_member(SimpleOidList *list, Oid val)
-{
-	SimpleOidListCell *cell;
-
-	for (cell = list->head; cell; cell = cell->next)
-	{
-		if (cell->val == val)
-			return true;
-	}
-	return false;
 }

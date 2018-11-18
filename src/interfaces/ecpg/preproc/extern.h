@@ -4,7 +4,8 @@
 #define _ECPG_PREPROC_EXTERN_H
 
 #include "type.h"
-#include "parser/keywords.h"
+
+#include "common/keywords.h"
 
 #include <errno.h>
 #ifndef CHAR_BIT
@@ -34,15 +35,15 @@ extern char *descriptor_index;
 extern char *descriptor_name;
 extern char *connection;
 extern char *input_filename;
-extern char *yytext,
+extern char *base_yytext,
 		   *token_start;
 
 #ifdef YYDEBUG
-extern int	yydebug;
+extern int	base_yydebug;
 #endif
-extern int	yylineno;
-extern FILE *yyin,
-		   *yyout;
+extern int	base_yylineno;
+extern FILE *base_yyin,
+		   *base_yyout;
 extern char *output_filename;
 
 extern struct _include_path *include_paths;
@@ -75,7 +76,7 @@ extern char *hashline_number(void);
 extern int	base_yyparse(void);
 extern int	base_yylex(void);
 extern void base_yyerror(const char *);
-extern void *mm_alloc(size_t), *mm_realloc(void *, size_t);
+extern void *mm_alloc(size_t);
 extern char *mm_strdup(const char *);
 extern void mmerror(int errorcode, enum errortype type, const char *error,...) pg_attribute_printf(3, 4);
 extern void mmfatal(int errorcode, const char *error,...) pg_attribute_printf(2, 3) pg_attribute_noreturn();
@@ -93,7 +94,7 @@ extern struct variable *descriptor_variable(const char *name, int input);
 extern struct variable *sqlda_variable(const char *name);
 extern void add_variable_to_head(struct arguments **, struct variable *, struct variable *);
 extern void add_variable_to_tail(struct arguments **, struct variable *, struct variable *);
-extern void remove_variable_from_list(struct arguments ** list, struct variable * var);
+extern void remove_variable_from_list(struct arguments **list, struct variable *var);
 extern void dump_variables(struct arguments *, int);
 extern struct typedefs *get_typedef(char *);
 extern void adjust_array(enum ECPGttype, char **, char **, char *, char *, int, bool);
@@ -104,9 +105,7 @@ extern void remove_variables(int);
 extern struct variable *new_variable(const char *, struct ECPGtype *, int);
 extern const ScanKeyword *ScanCKeywordLookup(const char *);
 extern const ScanKeyword *ScanECPGKeywordLookup(const char *text);
-extern void scanner_init(const char *);
 extern void parser_init(void);
-extern void scanner_finish(void);
 extern int	filtered_base_yylex(void);
 
 /* return codes */
@@ -121,10 +120,12 @@ extern int	filtered_base_yylex(void);
 
 enum COMPAT_MODE
 {
-	ECPG_COMPAT_PGSQL = 0, ECPG_COMPAT_INFORMIX, ECPG_COMPAT_INFORMIX_SE
+	ECPG_COMPAT_PGSQL = 0, ECPG_COMPAT_INFORMIX, ECPG_COMPAT_INFORMIX_SE, ECPG_COMPAT_ORACLE
 };
 extern enum COMPAT_MODE compat;
 
 #define INFORMIX_MODE	(compat == ECPG_COMPAT_INFORMIX || compat == ECPG_COMPAT_INFORMIX_SE)
+#define ORACLE_MODE (compat == ECPG_COMPAT_ORACLE)
 
-#endif   /* _ECPG_PREPROC_EXTERN_H */
+
+#endif							/* _ECPG_PREPROC_EXTERN_H */

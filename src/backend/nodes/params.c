@@ -4,7 +4,7 @@
  *	  Support for finding the values associated with Param nodes.
  *
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,6 +15,7 @@
 
 #include "postgres.h"
 
+#include "nodes/bitmapset.h"
 #include "nodes/params.h"
 #include "storage/shmem.h"
 #include "utils/datum.h"
@@ -47,20 +48,25 @@ copyParamList(ParamListInfo from)
 	retval = (ParamListInfo) palloc(size);
 	retval->paramFetch = NULL;
 	retval->paramFetchArg = NULL;
+	retval->paramCompile = NULL;
+	retval->paramCompileArg = NULL;
 	retval->parserSetup = NULL;
 	retval->parserSetupArg = NULL;
 	retval->numParams = from->numParams;
 
 	for (i = 0; i < from->numParams; i++)
 	{
-		ParamExternData *oprm = &from->params[i];
+		ParamExternData *oprm;
 		ParamExternData *nprm = &retval->params[i];
+		ParamExternData prmdata;
 		int16		typLen;
 		bool		typByVal;
 
 		/* give hook a chance in case parameter is dynamic */
-		if (!OidIsValid(oprm->ptype) && from->paramFetch != NULL)
-			(*from->paramFetch) (from, i + 1);
+		if (from->paramFetch != NULL)
+			oprm = from->paramFetch(from, i + 1, false, &prmdata);
+		else
+			oprm = &from->params[i];
 
 		/* flat-copy the parameter info */
 		*nprm = *oprm;
@@ -81,28 +87,34 @@ copyParamList(ParamListInfo from)
 Size
 EstimateParamListSpace(ParamListInfo paramLI)
 {
-	int		i;
-	Size	sz = sizeof(int);
+	int			i;
+	Size		sz = sizeof(int);
 
 	if (paramLI == NULL || paramLI->numParams <= 0)
 		return sz;
 
 	for (i = 0; i < paramLI->numParams; i++)
 	{
-		ParamExternData *prm = &paramLI->params[i];
+		ParamExternData *prm;
+		ParamExternData prmdata;
+		Oid			typeOid;
 		int16		typLen;
 		bool		typByVal;
 
 		/* give hook a chance in case parameter is dynamic */
-		if (!OidIsValid(prm->ptype) && paramLI->paramFetch != NULL)
-			(*paramLI->paramFetch) (paramLI, i + 1);
+		if (paramLI->paramFetch != NULL)
+			prm = paramLI->paramFetch(paramLI, i + 1, false, &prmdata);
+		else
+			prm = &paramLI->params[i];
 
-		sz = add_size(sz, sizeof(Oid));			/* space for type OID */
-		sz = add_size(sz, sizeof(uint16));		/* space for pflags */
+		typeOid = prm->ptype;
+
+		sz = add_size(sz, sizeof(Oid)); /* space for type OID */
+		sz = add_size(sz, sizeof(uint16));	/* space for pflags */
 
 		/* space for datum/isnull */
-		if (OidIsValid(prm->ptype))
-			get_typlenbyval(prm->ptype, &typLen, &typByVal);
+		if (OidIsValid(typeOid))
+			get_typlenbyval(typeOid, &typLen, &typByVal);
 		else
 		{
 			/* If no type OID, assume by-value, like copyParamList does. */
@@ -110,7 +122,7 @@ EstimateParamListSpace(ParamListInfo paramLI)
 			typByVal = true;
 		}
 		sz = add_size(sz,
-			datumEstimateSpace(prm->value, prm->isnull, typByVal, typLen));
+					  datumEstimateSpace(prm->value, prm->isnull, typByVal, typLen));
 	}
 
 	return sz;
@@ -149,16 +161,22 @@ SerializeParamList(ParamListInfo paramLI, char **start_address)
 	/* Write each parameter in turn. */
 	for (i = 0; i < nparams; i++)
 	{
-		ParamExternData *prm = &paramLI->params[i];
+		ParamExternData *prm;
+		ParamExternData prmdata;
+		Oid			typeOid;
 		int16		typLen;
 		bool		typByVal;
 
 		/* give hook a chance in case parameter is dynamic */
-		if (!OidIsValid(prm->ptype) && paramLI->paramFetch != NULL)
-			(*paramLI->paramFetch) (paramLI, i + 1);
+		if (paramLI->paramFetch != NULL)
+			prm = paramLI->paramFetch(paramLI, i + 1, false, &prmdata);
+		else
+			prm = &paramLI->params[i];
+
+		typeOid = prm->ptype;
 
 		/* Write type OID. */
-		memcpy(*start_address, &prm->ptype, sizeof(Oid));
+		memcpy(*start_address, &typeOid, sizeof(Oid));
 		*start_address += sizeof(Oid);
 
 		/* Write flags. */
@@ -166,8 +184,8 @@ SerializeParamList(ParamListInfo paramLI, char **start_address)
 		*start_address += sizeof(uint16);
 
 		/* Write datum/isnull. */
-		if (OidIsValid(prm->ptype))
-			get_typlenbyval(prm->ptype, &typLen, &typByVal);
+		if (OidIsValid(typeOid))
+			get_typlenbyval(typeOid, &typLen, &typByVal);
 		else
 		{
 			/* If no type OID, assume by-value, like copyParamList does. */
@@ -206,6 +224,8 @@ RestoreParamList(char **start_address)
 	paramLI = (ParamListInfo) palloc(size);
 	paramLI->paramFetch = NULL;
 	paramLI->paramFetchArg = NULL;
+	paramLI->paramCompile = NULL;
+	paramLI->paramCompileArg = NULL;
 	paramLI->parserSetup = NULL;
 	paramLI->parserSetupArg = NULL;
 	paramLI->numParams = nparams;

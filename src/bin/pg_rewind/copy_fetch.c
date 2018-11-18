@@ -3,18 +3,16 @@
  * copy_fetch.c
  *	  Functions for using a data directory as the source.
  *
- * Portions Copyright (c) 2013-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2018, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres_fe.h"
 
-#include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <string.h>
 
 #include "datapagemap.h"
 #include "fetch.h"
@@ -22,8 +20,6 @@
 #include "filemap.h"
 #include "logging.h"
 #include "pg_rewind.h"
-
-#include "catalog/catalog.h"
 
 static void recurse_dir(const char *datadir, const char *path,
 			process_file_callback_t callback);
@@ -67,14 +63,14 @@ recurse_dir(const char *datadir, const char *parentpath,
 	while (errno = 0, (xlde = readdir(xldir)) != NULL)
 	{
 		struct stat fst;
-		char		fullpath[MAXPGPATH];
-		char		path[MAXPGPATH];
+		char		fullpath[MAXPGPATH * 2];
+		char		path[MAXPGPATH * 2];
 
 		if (strcmp(xlde->d_name, ".") == 0 ||
 			strcmp(xlde->d_name, "..") == 0)
 			continue;
 
-		snprintf(fullpath, MAXPGPATH, "%s/%s", fullparentpath, xlde->d_name);
+		snprintf(fullpath, sizeof(fullpath), "%s/%s", fullparentpath, xlde->d_name);
 
 		if (lstat(fullpath, &fst) < 0)
 		{
@@ -95,9 +91,9 @@ recurse_dir(const char *datadir, const char *parentpath,
 		}
 
 		if (parentpath)
-			snprintf(path, MAXPGPATH, "%s/%s", parentpath, xlde->d_name);
+			snprintf(path, sizeof(path), "%s/%s", parentpath, xlde->d_name);
 		else
-			snprintf(path, MAXPGPATH, "%s", xlde->d_name);
+			snprintf(path, sizeof(path), "%s", xlde->d_name);
 
 		if (S_ISREG(fst.st_mode))
 			callback(path, FILE_TYPE_REGULAR, fst.st_size, NULL);
@@ -131,15 +127,15 @@ recurse_dir(const char *datadir, const char *parentpath,
 			/*
 			 * If it's a symlink within pg_tblspc, we need to recurse into it,
 			 * to process all the tablespaces.  We also follow a symlink if
-			 * it's for pg_xlog.  Symlinks elsewhere are ignored.
+			 * it's for pg_wal.  Symlinks elsewhere are ignored.
 			 */
 			if ((parentpath && strcmp(parentpath, "pg_tblspc") == 0) ||
-				strcmp(path, "pg_xlog") == 0)
+				strcmp(path, "pg_wal") == 0)
 				recurse_dir(datadir, path, callback);
 #else
 			pg_fatal("\"%s\" is a symbolic link, but symbolic links are not supported on this platform\n",
 					 fullpath);
-#endif   /* HAVE_READLINK */
+#endif							/* HAVE_READLINK */
 		}
 	}
 
@@ -158,9 +154,9 @@ recurse_dir(const char *datadir, const char *parentpath,
  * If 'trunc' is true, any existing file with the same name is truncated.
  */
 static void
-copy_file_range(const char *path, off_t begin, off_t end, bool trunc)
+rewind_copy_file_range(const char *path, off_t begin, off_t end, bool trunc)
 {
-	char		buf[BLCKSZ];
+	PGAlignedBlock buf;
 	char		srcpath[MAXPGPATH];
 	int			srcfd;
 
@@ -186,7 +182,7 @@ copy_file_range(const char *path, off_t begin, off_t end, bool trunc)
 		else
 			len = end - begin;
 
-		readlen = read(srcfd, buf, len);
+		readlen = read(srcfd, buf.data, len);
 
 		if (readlen < 0)
 			pg_fatal("could not read file \"%s\": %s\n",
@@ -194,7 +190,7 @@ copy_file_range(const char *path, off_t begin, off_t end, bool trunc)
 		else if (readlen == 0)
 			pg_fatal("unexpected EOF while reading file \"%s\"\n", srcpath);
 
-		write_target_range(buf, begin, readlen);
+		write_target_range(buf.data, begin, readlen);
 		begin += readlen;
 	}
 
@@ -224,7 +220,7 @@ copy_executeFileMap(filemap_t *map)
 				break;
 
 			case FILE_ACTION_COPY:
-				copy_file_range(entry->path, 0, entry->newsize, true);
+				rewind_copy_file_range(entry->path, 0, entry->newsize, true);
 				break;
 
 			case FILE_ACTION_TRUNCATE:
@@ -232,7 +228,8 @@ copy_executeFileMap(filemap_t *map)
 				break;
 
 			case FILE_ACTION_COPY_TAIL:
-				copy_file_range(entry->path, entry->oldsize, entry->newsize, false);
+				rewind_copy_file_range(entry->path, entry->oldsize,
+									   entry->newsize, false);
 				break;
 
 			case FILE_ACTION_CREATE:
@@ -259,7 +256,7 @@ execute_pagemap(datapagemap_t *pagemap, const char *path)
 	while (datapagemap_next(iter, &blkno))
 	{
 		offset = blkno * BLCKSZ;
-		copy_file_range(path, offset, offset + BLCKSZ, false);
+		rewind_copy_file_range(path, offset, offset + BLCKSZ, false);
 		/* Ok, this block has now been copied from new data dir to old */
 	}
 	pg_free(iter);

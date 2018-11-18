@@ -3,7 +3,7 @@
  * execJunk.c
  *	  Junk attribute support stuff....
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -78,7 +78,7 @@ ExecInitJunkFilter(List *targetList, bool hasoid, TupleTableSlot *slot)
 	if (slot)
 		ExecSetSlotDescriptor(slot, cleanTupType);
 	else
-		slot = MakeSingleTupleTableSlot(cleanTupType);
+		slot = MakeSingleTupleTableSlot(cleanTupType, &TTSOpsVirtual);
 
 	/*
 	 * Now calculate the mapping between the original tuple's attributes and
@@ -149,7 +149,7 @@ ExecInitJunkFilterConversion(List *targetList,
 	if (slot)
 		ExecSetSlotDescriptor(slot, cleanTupType);
 	else
-		slot = MakeSingleTupleTableSlot(cleanTupType);
+		slot = MakeSingleTupleTableSlot(cleanTupType, &TTSOpsVirtual);
 
 	/*
 	 * Calculate the mapping between the original tuple's attributes and the
@@ -168,7 +168,7 @@ ExecInitJunkFilterConversion(List *targetList,
 		t = list_head(targetList);
 		for (i = 0; i < cleanLength; i++)
 		{
-			if (cleanTupType->attrs[i]->attisdropped)
+			if (TupleDescAttr(cleanTupType, i)->attisdropped)
 				continue;		/* map entry is already zero */
 			for (;;)
 			{

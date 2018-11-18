@@ -1,7 +1,7 @@
 use strict;
 use warnings;
 use TestLib;
-use Test::More tests => 4;
+use Test::More tests => 6;
 
 use RewindTest;
 
@@ -9,13 +9,13 @@ sub run_test
 {
 	my $test_mode = shift;
 
-	RewindTest::setup_cluster();
+	RewindTest::setup_cluster($test_mode, ['-g']);
 	RewindTest::start_master();
 
 	# Create a database in master.
 	master_psql('CREATE DATABASE inmaster');
 
-	RewindTest::create_standby();
+	RewindTest::create_standby($test_mode);
 
 	# Create another database, the creation is replicated to the standby
 	master_psql('CREATE DATABASE beforepromotion');
@@ -32,17 +32,28 @@ sub run_test
 
 	# Check that the correct databases are present after pg_rewind.
 	check_query(
-		'SELECT datname FROM pg_database',
-		qq(template1
-template0
-postgres
+		'SELECT datname FROM pg_database ORDER BY 1',
+		qq(beforepromotion
 inmaster
-beforepromotion
+postgres
 standby_afterpromotion
+template0
+template1
 ),
 		'database names');
 
+	# Permissions on PGDATA should have group permissions
+  SKIP:
+	{
+		skip "unix-style permissions not supported on Windows", 1
+		  if ($windows_os);
+
+		ok(check_mode_recursive($node_master->data_dir(), 0750, 0640),
+			'check PGDATA permissions');
+	}
+
 	RewindTest::clean_rewind_test();
+	return;
 }
 
 # Run the test in both modes.

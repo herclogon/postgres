@@ -4,7 +4,7 @@
  *	  page utilities routines for the postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,8 +15,11 @@
 #include "postgres.h"
 
 #include "access/gin_private.h"
+#include "access/ginxlog.h"
 #include "access/xloginsert.h"
+#include "storage/predicate.h"
 #include "miscadmin.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 static void ginFindParents(GinBtree btree, GinBtreeStack *stack);
@@ -29,7 +32,7 @@ static void ginFinishSplit(GinBtree btree, GinBtreeStack *stack,
 /*
  * Lock buffer by needed method for search.
  */
-static int
+int
 ginTraverseLock(Buffer buffer, bool searchMode)
 {
 	Page		page;
@@ -39,7 +42,7 @@ ginTraverseLock(Buffer buffer, bool searchMode)
 	page = BufferGetPage(buffer);
 	if (GinPageIsLeaf(page))
 	{
-		if (searchMode == FALSE)
+		if (searchMode == false)
 		{
 			/* we should relock our page */
 			LockBuffer(buffer, GIN_UNLOCK);
@@ -71,7 +74,7 @@ ginTraverseLock(Buffer buffer, bool searchMode)
  * is share-locked, and stack->parent is NULL.
  */
 GinBtreeStack *
-ginFindLeafPage(GinBtree btree, bool searchMode)
+ginFindLeafPage(GinBtree btree, bool searchMode, Snapshot snapshot)
 {
 	GinBtreeStack *stack;
 
@@ -80,6 +83,9 @@ ginFindLeafPage(GinBtree btree, bool searchMode)
 	stack->buffer = ReadBuffer(btree->index, btree->rootBlkno);
 	stack->parent = NULL;
 	stack->predictNumber = 1;
+
+	if (!searchMode)
+		CheckForSerializableConflictIn(btree->index, NULL, stack->buffer);
 
 	for (;;)
 	{
@@ -90,6 +96,7 @@ ginFindLeafPage(GinBtree btree, bool searchMode)
 		stack->off = InvalidOffsetNumber;
 
 		page = BufferGetPage(stack->buffer);
+		TestForOldSnapshot(snapshot, btree->index, page);
 
 		access = ginTraverseLock(stack->buffer, searchMode);
 
@@ -104,7 +111,7 @@ ginFindLeafPage(GinBtree btree, bool searchMode)
 		 * ok, page is correctly locked, we should check to move right ..,
 		 * root never has a right link, so small optimization
 		 */
-		while (btree->fullScan == FALSE && stack->blkno != btree->rootBlkno &&
+		while (btree->fullScan == false && stack->blkno != btree->rootBlkno &&
 			   btree->isMoveRight(btree, page))
 		{
 			BlockNumber rightlink = GinPageGetOpaque(page)->rightlink;
@@ -116,6 +123,7 @@ ginFindLeafPage(GinBtree btree, bool searchMode)
 			stack->buffer = ginStepRight(stack->buffer, btree->index, access);
 			stack->blkno = rightlink;
 			page = BufferGetPage(stack->buffer);
+			TestForOldSnapshot(snapshot, btree->index, page);
 
 			if (!searchMode && GinPageIsIncompleteSplit(page))
 				ginFinishSplit(btree, stack, false, NULL);
@@ -203,7 +211,7 @@ freeGinBtreeStack(GinBtreeStack *stack)
 /*
  * Try to find parent for current stack position. Returns correct parent and
  * child's offset in stack->parent. The root page is never released, to
- * to prevent conflict with vacuum process.
+ * prevent conflict with vacuum process.
  */
 static void
 ginFindParents(GinBtree btree, GinBtreeStack *stack)
@@ -310,15 +318,16 @@ ginFindParents(GinBtree btree, GinBtreeStack *stack)
  * Insert a new item to a page.
  *
  * Returns true if the insertion was finished. On false, the page was split and
- * the parent needs to be updated. (a root split returns true as it doesn't
- * need any further action by the caller to complete)
+ * the parent needs to be updated. (A root split returns true as it doesn't
+ * need any further action by the caller to complete.)
  *
  * When inserting a downlink to an internal page, 'childbuf' contains the
  * child page that was split. Its GIN_INCOMPLETE_SPLIT flag will be cleared
- * atomically with the insert. Also, the existing item at the given location
- * is updated to point to 'updateblkno'.
+ * atomically with the insert. Also, the existing item at offset stack->off
+ * in the target page is updated to point to updateblkno.
  *
  * stack->buffer is locked on entry, and is kept locked.
+ * Likewise for childbuf, if given.
  */
 static bool
 ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
@@ -326,11 +335,26 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 			   Buffer childbuf, GinStatsData *buildStats)
 {
 	Page		page = BufferGetPage(stack->buffer);
+	bool		result;
 	GinPlaceToPageRC rc;
 	uint16		xlflags = 0;
 	Page		childpage = NULL;
 	Page		newlpage = NULL,
 				newrpage = NULL;
+	void	   *ptp_workspace = NULL;
+	MemoryContext tmpCxt;
+	MemoryContext oldCxt;
+
+	/*
+	 * We do all the work of this function and its subfunctions in a temporary
+	 * memory context.  This avoids leakages and simplifies APIs, since some
+	 * subfunctions allocate storage that has to survive until we've finished
+	 * the WAL insertion.
+	 */
+	tmpCxt = AllocSetContextCreate(CurrentMemoryContext,
+								   "ginPlaceToPage temporary context",
+								   ALLOCSET_DEFAULT_SIZES);
+	oldCxt = MemoryContextSwitchTo(tmpCxt);
 
 	if (GinPageIsData(page))
 		xlflags |= GIN_INSERT_ISDATA;
@@ -348,40 +372,42 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 	}
 
 	/*
-	 * Try to put the incoming tuple on the page. placeToPage will decide if
-	 * the page needs to be split.
-	 *
-	 * WAL-logging this operation is a bit funny:
-	 *
-	 * We're responsible for calling XLogBeginInsert() and XLogInsert().
-	 * XLogBeginInsert() must be called before placeToPage, because
-	 * placeToPage can register some data to the WAL record.
-	 *
-	 * If placeToPage returns INSERTED, placeToPage has already called
-	 * START_CRIT_SECTION() and XLogBeginInsert(), and registered any data
-	 * required to replay the operation, in block index 0. We're responsible
-	 * for filling in the main data portion of the WAL record, calling
-	 * XLogInsert(), and END_CRIT_SECTION.
-	 *
-	 * If placeToPage returns SPLIT, we're wholly responsible for WAL logging.
-	 * Splits happen infrequently, so we just make a full-page image of all
-	 * the pages involved.
+	 * See if the incoming tuple will fit on the page.  beginPlaceToPage will
+	 * decide if the page needs to be split, and will compute the split
+	 * contents if so.  See comments for beginPlaceToPage and execPlaceToPage
+	 * functions for more details of the API here.
 	 */
-	rc = btree->placeToPage(btree, stack->buffer, stack,
-							insertdata, updateblkno,
-							&newlpage, &newrpage);
-	if (rc == UNMODIFIED)
+	rc = btree->beginPlaceToPage(btree, stack->buffer, stack,
+								 insertdata, updateblkno,
+								 &ptp_workspace,
+								 &newlpage, &newrpage);
+
+	if (rc == GPTP_NO_WORK)
 	{
-		XLogResetInsertion();
-		return true;
+		/* Nothing to do */
+		result = true;
 	}
-	else if (rc == INSERTED)
+	else if (rc == GPTP_INSERT)
 	{
-		/* placeToPage did START_CRIT_SECTION() */
+		/* It will fit, perform the insertion */
+		START_CRIT_SECTION();
+
+		if (RelationNeedsWAL(btree->index))
+		{
+			XLogBeginInsert();
+			XLogRegisterBuffer(0, stack->buffer, REGBUF_STANDARD);
+			if (BufferIsValid(childbuf))
+				XLogRegisterBuffer(1, childbuf, REGBUF_STANDARD);
+		}
+
+		/* Perform the page update, and register any extra WAL data */
+		btree->execPlaceToPage(btree, stack->buffer, stack,
+							   insertdata, updateblkno, ptp_workspace);
+
 		MarkBufferDirty(stack->buffer);
 
 		/* An insert to an internal page finishes the split of the child. */
-		if (childbuf != InvalidBuffer)
+		if (BufferIsValid(childbuf))
 		{
 			GinPageGetOpaque(childpage)->flags &= ~GIN_INCOMPLETE_SPLIT;
 			MarkBufferDirty(childbuf);
@@ -393,13 +419,7 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 			ginxlogInsert xlrec;
 			BlockIdData childblknos[2];
 
-			/*
-			 * placetopage already registered stack->buffer as block 0.
-			 */
 			xlrec.flags = xlflags;
-
-			if (childbuf != InvalidBuffer)
-				XLogRegisterBuffer(1, childbuf, REGBUF_STANDARD);
 
 			XLogRegisterData((char *) &xlrec, sizeof(ginxlogInsert));
 
@@ -407,7 +427,7 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 			 * Log information about child if this was an insertion of a
 			 * downlink.
 			 */
-			if (childbuf != InvalidBuffer)
+			if (BufferIsValid(childbuf))
 			{
 				BlockIdSet(&childblknos[0], BufferGetBlockNumber(childbuf));
 				BlockIdSet(&childblknos[1], GinPageGetOpaque(childpage)->rightlink);
@@ -417,23 +437,29 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 
 			recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_INSERT);
 			PageSetLSN(page, recptr);
-			if (childbuf != InvalidBuffer)
+			if (BufferIsValid(childbuf))
 				PageSetLSN(childpage, recptr);
 		}
 
 		END_CRIT_SECTION();
 
-		return true;
+		/* Insertion is complete. */
+		result = true;
 	}
-	else if (rc == SPLIT)
+	else if (rc == GPTP_SPLIT)
 	{
-		/* Didn't fit, had to split */
+		/*
+		 * Didn't fit, need to split.  The split has been computed in newlpage
+		 * and newrpage, which are pointers to palloc'd pages, not associated
+		 * with buffers.  stack->buffer is not touched yet.
+		 */
 		Buffer		rbuffer;
 		BlockNumber savedRightLink;
 		ginxlogSplit data;
 		Buffer		lbuffer = InvalidBuffer;
 		Page		newrootpg = NULL;
 
+		/* Get a new index page to become the right page */
 		rbuffer = GinNewBuffer(btree->index);
 
 		/* During index build, count the new page */
@@ -447,19 +473,11 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 
 		savedRightLink = GinPageGetOpaque(page)->rightlink;
 
-		/*
-		 * newlpage and newrpage are pointers to memory pages, not associated
-		 * with buffers. stack->buffer is not touched yet.
-		 */
-
+		/* Begin setting up WAL record */
 		data.node = btree->index->rd_node;
 		data.flags = xlflags;
-		if (childbuf != InvalidBuffer)
+		if (BufferIsValid(childbuf))
 		{
-			Page		childpage = BufferGetPage(childbuf);
-
-			GinPageGetOpaque(childpage)->flags &= ~GIN_INCOMPLETE_SPLIT;
-
 			data.leftChildBlkno = BufferGetBlockNumber(childbuf);
 			data.rightChildBlkno = GinPageGetOpaque(childpage)->rightlink;
 		}
@@ -469,12 +487,12 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 		if (stack->parent == NULL)
 		{
 			/*
-			 * split root, so we need to allocate new left page and place
-			 * pointer on root to left and right page
+			 * splitting the root, so we need to allocate new left page and
+			 * place pointers to left and right page on root page.
 			 */
 			lbuffer = GinNewBuffer(btree->index);
 
-			/* During index build, count the newly-added root page */
+			/* During index build, count the new left page */
 			if (buildStats)
 			{
 				if (btree->isData)
@@ -491,9 +509,9 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 
 			/*
 			 * Construct a new root page containing downlinks to the new left
-			 * and right pages. (do this in a temporary copy first rather than
-			 * overwriting the original page directly, so that we can still
-			 * abort gracefully if this fails.)
+			 * and right pages.  (Do this in a temporary copy rather than
+			 * overwriting the original page directly, since we're not in the
+			 * critical section yet.)
 			 */
 			newrootpg = PageGetTempPage(newrpage);
 			GinInitPage(newrootpg, GinPageGetOpaque(newlpage)->flags & ~(GIN_LEAF | GIN_COMPRESSED), BLCKSZ);
@@ -501,51 +519,75 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 			btree->fillRoot(btree, newrootpg,
 							BufferGetBlockNumber(lbuffer), newlpage,
 							BufferGetBlockNumber(rbuffer), newrpage);
+
+			if (GinPageIsLeaf(BufferGetPage(stack->buffer)))
+			{
+
+				PredicateLockPageSplit(btree->index,
+									   BufferGetBlockNumber(stack->buffer),
+									   BufferGetBlockNumber(lbuffer));
+
+				PredicateLockPageSplit(btree->index,
+									   BufferGetBlockNumber(stack->buffer),
+									   BufferGetBlockNumber(rbuffer));
+			}
+
 		}
 		else
 		{
-			/* split non-root page */
+			/* splitting a non-root page */
 			data.rrlink = savedRightLink;
 
 			GinPageGetOpaque(newrpage)->rightlink = savedRightLink;
 			GinPageGetOpaque(newlpage)->flags |= GIN_INCOMPLETE_SPLIT;
 			GinPageGetOpaque(newlpage)->rightlink = BufferGetBlockNumber(rbuffer);
+
+			if (GinPageIsLeaf(BufferGetPage(stack->buffer)))
+			{
+
+				PredicateLockPageSplit(btree->index,
+									   BufferGetBlockNumber(stack->buffer),
+									   BufferGetBlockNumber(rbuffer));
+			}
 		}
 
 		/*
-		 * Ok, we have the new contents of the left page in a temporary copy
-		 * now (newlpage), and the newly-allocated right block has been filled
-		 * in. The original page is still unchanged.
+		 * OK, we have the new contents of the left page in a temporary copy
+		 * now (newlpage), and likewise for the new contents of the
+		 * newly-allocated right block. The original page is still unchanged.
 		 *
 		 * If this is a root split, we also have a temporary page containing
-		 * the new contents of the root. Copy the new left page to a
-		 * newly-allocated block, and initialize the (original) root page the
-		 * new copy. Otherwise, copy over the temporary copy of the new left
-		 * page over the old left page.
+		 * the new contents of the root.
 		 */
 
 		START_CRIT_SECTION();
 
 		MarkBufferDirty(rbuffer);
 		MarkBufferDirty(stack->buffer);
-		if (BufferIsValid(childbuf))
-			MarkBufferDirty(childbuf);
 
 		/*
-		 * Restore the temporary copies over the real buffers. But don't free
-		 * the temporary copies yet, WAL record data points to them.
+		 * Restore the temporary copies over the real buffers.
 		 */
 		if (stack->parent == NULL)
 		{
+			/* Splitting the root, three pages to update */
 			MarkBufferDirty(lbuffer);
-			memcpy(BufferGetPage(stack->buffer), newrootpg, BLCKSZ);
+			memcpy(page, newrootpg, BLCKSZ);
 			memcpy(BufferGetPage(lbuffer), newlpage, BLCKSZ);
 			memcpy(BufferGetPage(rbuffer), newrpage, BLCKSZ);
 		}
 		else
 		{
-			memcpy(BufferGetPage(stack->buffer), newlpage, BLCKSZ);
+			/* Normal split, only two pages to update */
+			memcpy(page, newlpage, BLCKSZ);
 			memcpy(BufferGetPage(rbuffer), newrpage, BLCKSZ);
+		}
+
+		/* We also clear childbuf's INCOMPLETE_SPLIT flag, if passed */
+		if (BufferIsValid(childbuf))
+		{
+			GinPageGetOpaque(childpage)->flags &= ~GIN_INCOMPLETE_SPLIT;
+			MarkBufferDirty(childbuf);
 		}
 
 		/* write WAL record */
@@ -572,12 +614,13 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 				XLogRegisterBuffer(1, rbuffer, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 			}
 			if (BufferIsValid(childbuf))
-				XLogRegisterBuffer(3, childbuf, 0);
+				XLogRegisterBuffer(3, childbuf, REGBUF_STANDARD);
 
 			XLogRegisterData((char *) &data, sizeof(ginxlogSplit));
 
 			recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_SPLIT);
-			PageSetLSN(BufferGetPage(stack->buffer), recptr);
+
+			PageSetLSN(page, recptr);
 			PageSetLSN(BufferGetPage(rbuffer), recptr);
 			if (stack->parent == NULL)
 				PageSetLSN(BufferGetPage(lbuffer), recptr);
@@ -587,33 +630,31 @@ ginPlaceToPage(GinBtree btree, GinBtreeStack *stack,
 		END_CRIT_SECTION();
 
 		/*
-		 * We can release the lock on the right page now, but keep the
-		 * original buffer locked.
+		 * We can release the locks/pins on the new pages now, but keep
+		 * stack->buffer locked.  childbuf doesn't get unlocked either.
 		 */
 		UnlockReleaseBuffer(rbuffer);
 		if (stack->parent == NULL)
 			UnlockReleaseBuffer(lbuffer);
-
-		pfree(newlpage);
-		pfree(newrpage);
-		if (newrootpg)
-			pfree(newrootpg);
 
 		/*
 		 * If we split the root, we're done. Otherwise the split is not
 		 * complete until the downlink for the new page has been inserted to
 		 * the parent.
 		 */
-		if (stack->parent == NULL)
-			return true;
-		else
-			return false;
+		result = (stack->parent == NULL);
 	}
 	else
 	{
-		elog(ERROR, "unknown return code from GIN placeToPage method: %d", rc);
-		return false;			/* keep compiler quiet */
+		elog(ERROR, "invalid return code from GIN placeToPage method: %d", rc);
+		result = false;			/* keep compiler quiet */
 	}
+
+	/* Clean up temp context */
+	MemoryContextSwitchTo(oldCxt);
+	MemoryContextDelete(tmpCxt);
+
+	return result;
 }
 
 /*

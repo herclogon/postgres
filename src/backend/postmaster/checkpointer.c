@@ -26,7 +26,7 @@
  * restart needs to be forced.)
  *
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -49,6 +49,7 @@
 #include "postmaster/bgwriter.h"
 #include "replication/syncrep.h"
 #include "storage/bufmgr.h"
+#include "storage/condition_variable.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -115,7 +116,7 @@ typedef struct
 
 typedef struct
 {
-	pid_t		checkpointer_pid;		/* PID (0 if not started) */
+	pid_t		checkpointer_pid;	/* PID (0 if not started) */
 
 	slock_t		ckpt_lck;		/* protects all the ckpt_* fields */
 
@@ -125,8 +126,8 @@ typedef struct
 
 	int			ckpt_flags;		/* checkpoint flags, as defined in xlog.h */
 
-	uint32		num_backend_writes;		/* counts user backend buffer writes */
-	uint32		num_backend_fsync;		/* counts user backend fsync calls */
+	uint32		num_backend_writes; /* counts user backend buffer writes */
+	uint32		num_backend_fsync;	/* counts user backend fsync calls */
 
 	int			num_requests;	/* current # of requests */
 	int			max_requests;	/* allocated array size */
@@ -204,24 +205,19 @@ CheckpointerMain(void)
 	 * want to wait for the backends to exit, whereupon the postmaster will
 	 * tell us it's okay to shut down (via SIGUSR2).
 	 */
-	pqsignal(SIGHUP, ChkptSigHupHandler);		/* set flag to read config
-												 * file */
-	pqsignal(SIGINT, ReqCheckpointHandler);		/* request checkpoint */
+	pqsignal(SIGHUP, ChkptSigHupHandler);	/* set flag to read config file */
+	pqsignal(SIGINT, ReqCheckpointHandler); /* request checkpoint */
 	pqsignal(SIGTERM, SIG_IGN); /* ignore SIGTERM */
 	pqsignal(SIGQUIT, chkpt_quickdie);	/* hard crash time */
 	pqsignal(SIGALRM, SIG_IGN);
 	pqsignal(SIGPIPE, SIG_IGN);
 	pqsignal(SIGUSR1, chkpt_sigusr1_handler);
-	pqsignal(SIGUSR2, ReqShutdownHandler);		/* request shutdown */
+	pqsignal(SIGUSR2, ReqShutdownHandler);	/* request shutdown */
 
 	/*
 	 * Reset some signals that are accepted by postmaster but not here
 	 */
 	pqsignal(SIGCHLD, SIG_DFL);
-	pqsignal(SIGTTIN, SIG_DFL);
-	pqsignal(SIGTTOU, SIG_DFL);
-	pqsignal(SIGCONT, SIG_DFL);
-	pqsignal(SIGWINCH, SIG_DFL);
 
 	/* We allow SIGQUIT (quickdie) at all times */
 	sigdelset(&BlockSig, SIGQUIT);
@@ -232,12 +228,6 @@ CheckpointerMain(void)
 	last_checkpoint_time = last_xlog_switch_time = (pg_time_t) time(NULL);
 
 	/*
-	 * Create a resource owner to keep track of our resources (currently only
-	 * buffer pins).
-	 */
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, "Checkpointer");
-
-	/*
 	 * Create a memory context that we will do all our work in.  We do this so
 	 * that we can reset the context during error recovery and thereby avoid
 	 * possible memory leaks.  Formerly this code just ran in
@@ -245,9 +235,7 @@ CheckpointerMain(void)
 	 */
 	checkpointer_context = AllocSetContextCreate(TopMemoryContext,
 												 "Checkpointer",
-												 ALLOCSET_DEFAULT_MINSIZE,
-												 ALLOCSET_DEFAULT_INITSIZE,
-												 ALLOCSET_DEFAULT_MAXSIZE);
+												 ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(checkpointer_context);
 
 	/*
@@ -273,16 +261,14 @@ CheckpointerMain(void)
 		 * files.
 		 */
 		LWLockReleaseAll();
+		ConditionVariableCancelSleep();
+		pgstat_report_wait_end();
 		AbortBufferIO();
 		UnlockBuffers();
-		/* buffer pins are released here: */
-		ResourceOwnerRelease(CurrentResourceOwner,
-							 RESOURCE_RELEASE_BEFORE_LOCKS,
-							 false, true);
-		/* we needn't bother with the other ResourceOwnerRelease phases */
+		ReleaseAuxProcessResources(false);
 		AtEOXact_Buffers(false);
 		AtEOXact_SMgr();
-		AtEOXact_Files();
+		AtEOXact_Files(false);
 		AtEOXact_HashTables(false);
 
 		/* Warn any waiting backends that the checkpoint failed. */
@@ -462,7 +448,7 @@ CheckpointerMain(void)
 				elapsed_secs < CheckPointWarning)
 				ereport(LOG,
 						(errmsg_plural("checkpoints are occurring too frequently (%d second apart)",
-				"checkpoints are occurring too frequently (%d seconds apart)",
+									   "checkpoints are occurring too frequently (%d seconds apart)",
 									   elapsed_secs,
 									   elapsed_secs),
 						 errhint("Consider increasing the configuration parameter \"max_wal_size\".")));
@@ -557,7 +543,8 @@ CheckpointerMain(void)
 
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-					   cur_timeout * 1000L /* convert to ms */ );
+					   cur_timeout * 1000L /* convert to ms */ ,
+					   WAIT_EVENT_CHECKPOINTER_MAIN);
 
 		/*
 		 * Emergency bailout if postmaster has died.  This is to avoid the
@@ -571,15 +558,21 @@ CheckpointerMain(void)
 /*
  * CheckArchiveTimeout -- check for archive_timeout and switch xlog files
  *
- * This will switch to a new WAL file and force an archive file write
- * if any activity is recorded in the current WAL file, including just
- * a single checkpoint record.
+ * This will switch to a new WAL file and force an archive file write if
+ * meaningful activity is recorded in the current WAL file. This includes most
+ * writes, including just a single checkpoint record, but excludes WAL records
+ * that were inserted with the XLOG_MARK_UNIMPORTANT flag being set (like
+ * snapshots of running transactions).  Such records, depending on
+ * configuration, occur on regular intervals and don't contain important
+ * information.  This avoids generating archives with a few unimportant
+ * records.
  */
 static void
 CheckArchiveTimeout(void)
 {
 	pg_time_t	now;
 	pg_time_t	last_time;
+	XLogRecPtr	last_switch_lsn;
 
 	if (XLogArchiveTimeout <= 0 || RecoveryInProgress())
 		return;
@@ -594,26 +587,33 @@ CheckArchiveTimeout(void)
 	 * Update local state ... note that last_xlog_switch_time is the last time
 	 * a switch was performed *or requested*.
 	 */
-	last_time = GetLastSegSwitchTime();
+	last_time = GetLastSegSwitchData(&last_switch_lsn);
 
 	last_xlog_switch_time = Max(last_xlog_switch_time, last_time);
 
-	/* Now we can do the real check */
+	/* Now we can do the real checks */
 	if ((int) (now - last_xlog_switch_time) >= XLogArchiveTimeout)
 	{
-		XLogRecPtr	switchpoint;
-
-		/* OK, it's time to switch */
-		switchpoint = RequestXLogSwitch();
-
 		/*
-		 * If the returned pointer points exactly to a segment boundary,
-		 * assume nothing happened.
+		 * Switch segment only when "important" WAL has been logged since the
+		 * last segment switch (last_switch_lsn points to end of segment
+		 * switch occurred in).
 		 */
-		if ((switchpoint % XLogSegSize) != 0)
-			ereport(DEBUG1,
-				(errmsg("transaction log switch forced (archive_timeout=%d)",
-						XLogArchiveTimeout)));
+		if (GetLastImportantRecPtr() > last_switch_lsn)
+		{
+			XLogRecPtr	switchpoint;
+
+			/* mark switch as unimportant, avoids triggering checkpoints */
+			switchpoint = RequestXLogSwitch(true);
+
+			/*
+			 * If the returned pointer points exactly to a segment boundary,
+			 * assume nothing happened.
+			 */
+			if (XLogSegmentOffset(switchpoint, wal_segment_size) != 0)
+				elog(DEBUG1, "write-ahead log switch forced (archive_timeout=%d)",
+					 XLogArchiveTimeout);
+		}
 
 		/*
 		 * Update state in any case, so we don't retry constantly when the
@@ -768,7 +768,8 @@ IsCheckpointOnSchedule(double progress)
 		recptr = GetXLogReplayRecPtr(NULL);
 	else
 		recptr = GetInsertRecPtr();
-	elapsed_xlogs = (((double) (recptr - ckpt_start_recptr)) / XLogSegSize) / CheckPointSegments;
+	elapsed_xlogs = (((double) (recptr - ckpt_start_recptr)) /
+					 wal_segment_size) / CheckPointSegments;
 
 	if (progress < elapsed_xlogs)
 	{
@@ -808,27 +809,21 @@ IsCheckpointOnSchedule(double progress)
 static void
 chkpt_quickdie(SIGNAL_ARGS)
 {
-	PG_SETMASK(&BlockSig);
-
 	/*
-	 * We DO NOT want to run proc_exit() callbacks -- we're here because
-	 * shared memory may be corrupted, so we don't want to try to clean up our
-	 * transaction.  Just nail the windows shut and get out of town.  Now that
-	 * there's an atexit callback to prevent third-party code from breaking
-	 * things by calling exit() directly, we have to reset the callbacks
-	 * explicitly to make this work as intended.
-	 */
-	on_exit_reset();
-
-	/*
-	 * Note we do exit(2) not exit(0).  This is to force the postmaster into a
-	 * system reset cycle if some idiot DBA sends a manual SIGQUIT to a random
+	 * We DO NOT want to run proc_exit() or atexit() callbacks -- we're here
+	 * because shared memory may be corrupted, so we don't want to try to
+	 * clean up our transaction.  Just nail the windows shut and get out of
+	 * town.  The callbacks wouldn't be safe to run from a signal handler,
+	 * anyway.
+	 *
+	 * Note we do _exit(2) not _exit(0).  This is to force the postmaster into
+	 * a system reset cycle if someone sends a manual SIGQUIT to a random
 	 * backend.  This is necessary precisely because we don't clean up our
 	 * shared memory state.  (The "dead man switch" mechanism in pmsignal.c
 	 * should ensure the postmaster sees this as a crash, too, but no harm in
 	 * being doubly sure.)
 	 */
-	exit(2);
+	_exit(2);
 }
 
 /* SIGHUP: set flag to re-read config file at next convenient time */
@@ -1266,8 +1261,8 @@ CompactCheckpointerRequestQueue(void)
 		CheckpointerShmem->requests[preserve_count++] = CheckpointerShmem->requests[n];
 	}
 	ereport(DEBUG1,
-	   (errmsg("compacted fsync request queue from %d entries to %d entries",
-			   CheckpointerShmem->num_requests, preserve_count)));
+			(errmsg("compacted fsync request queue from %d entries to %d entries",
+					CheckpointerShmem->num_requests, preserve_count)));
 	CheckpointerShmem->num_requests = preserve_count;
 
 	/* Cleanup. */

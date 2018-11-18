@@ -5,7 +5,7 @@
  *	  parse trees.
  *
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/parsetree.h
@@ -30,16 +30,6 @@
  */
 #define rt_fetch(rangetable_index, rangetable) \
 	((RangeTblEntry *) list_nth(rangetable, (rangetable_index)-1))
-
-/*
- *		getrelid
- *
- *		Given the range index of a relation, return the corresponding
- *		relation OID.  Note that InvalidOid will be returned if the
- *		RTE is for a non-relation-type RTE.
- */
-#define getrelid(rangeindex,rangetable) \
-	(rt_fetch(rangeindex, rangetable)->relid)
 
 /*
  * Given an RTE and an attribute number, return the appropriate
@@ -76,4 +66,4 @@ extern TargetEntry *get_tle_by_resno(List *tlist, AttrNumber resno);
 
 extern RowMarkClause *get_parse_rowmark(Query *qry, Index rtindex);
 
-#endif   /* PARSETREE_H */
+#endif							/* PARSETREE_H */

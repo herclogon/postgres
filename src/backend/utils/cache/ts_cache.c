@@ -17,7 +17,7 @@
  * any database access.
  *
  *
- * Copyright (c) 2006-2015, PostgreSQL Global Development Group
+ * Copyright (c) 2006-2018, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/cache/ts_cache.c
@@ -45,6 +45,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
@@ -294,16 +295,18 @@ lookup_ts_dictionary_cache(Oid dictId)
 
 			/* Create private memory context the first time through */
 			saveCtx = AllocSetContextCreate(CacheMemoryContext,
-											NameStr(dict->dictname),
-											ALLOCSET_SMALL_MINSIZE,
-											ALLOCSET_SMALL_INITSIZE,
-											ALLOCSET_SMALL_MAXSIZE);
+											"TS dictionary",
+											ALLOCSET_SMALL_SIZES);
+			MemoryContextCopyAndSetIdentifier(saveCtx, NameStr(dict->dictname));
 		}
 		else
 		{
 			/* Clear the existing entry's private context */
 			saveCtx = entry->dictCtx;
-			MemoryContextResetAndDeleteChildren(saveCtx);
+			/* Don't let context's ident pointer dangle while we reset it */
+			MemoryContextSetIdentifier(saveCtx, NULL);
+			MemoryContextReset(saveCtx);
+			MemoryContextCopyAndSetIdentifier(saveCtx, NameStr(dict->dictname));
 		}
 
 		MemSet(entry, 0, sizeof(TSDictionaryCacheEntry));
@@ -335,7 +338,7 @@ lookup_ts_dictionary_cache(Oid dictId)
 
 			entry->dictData =
 				DatumGetPointer(OidFunctionCall1(template->tmplinit,
-											  PointerGetDatum(dictoptions)));
+												 PointerGetDatum(dictoptions)));
 
 			MemoryContextSwitchTo(oldcontext);
 		}

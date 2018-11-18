@@ -3,7 +3,7 @@
  * constraint.c
  *	  PostgreSQL CONSTRAINT support code.
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -37,7 +37,7 @@
 Datum
 unique_key_recheck(PG_FUNCTION_ARGS)
 {
-	TriggerData *trigdata = (TriggerData *) fcinfo->context;
+	TriggerData *trigdata = castNode(TriggerData, fcinfo->context);
 	const char *funcname = "unique_key_recheck";
 	HeapTuple	new_row;
 	ItemPointerData tmptid;
@@ -122,9 +122,10 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	/*
 	 * The heap tuple must be put into a slot for FormIndexDatum.
 	 */
-	slot = MakeSingleTupleTableSlot(RelationGetDescr(trigdata->tg_relation));
+	slot = MakeSingleTupleTableSlot(RelationGetDescr(trigdata->tg_relation),
+									&TTSOpsHeapTuple);
 
-	ExecStoreTuple(new_row, slot, InvalidBuffer, false);
+	ExecStoreHeapTuple(new_row, slot, false);
 
 	/*
 	 * Typically the index won't have expressions, but if it does we need an
@@ -165,7 +166,8 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 		 * index will know about.
 		 */
 		index_insert(indexRel, values, isnull, &(new_row->t_self),
-					 trigdata->tg_relation, UNIQUE_CHECK_EXISTING);
+					 trigdata->tg_relation, UNIQUE_CHECK_EXISTING,
+					 indexInfo);
 	}
 	else
 	{

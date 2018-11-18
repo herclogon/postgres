@@ -33,6 +33,8 @@
 #include "pg_backup_tar.h"
 #include "pg_backup_utils.h"
 #include "pgtar.h"
+#include "common/file_utils.h"
+#include "fe_utils/string_utils.h"
 
 #include <sys/stat.h>
 #include <ctype.h>
@@ -47,8 +49,8 @@ static int	_WriteByte(ArchiveHandle *AH, const int i);
 static int	_ReadByte(ArchiveHandle *);
 static void _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len);
 static void _ReadBuf(ArchiveHandle *AH, void *buf, size_t len);
-static void _CloseArchive(ArchiveHandle *AH, DumpOptions *dopt);
-static void _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt);
+static void _CloseArchive(ArchiveHandle *AH);
+static void _PrintTocData(ArchiveHandle *AH, TocEntry *te);
 static void _WriteExtraToc(ArchiveHandle *AH, TocEntry *te);
 static void _ReadExtraToc(ArchiveHandle *AH, TocEntry *te);
 static void _PrintExtraToc(ArchiveHandle *AH, TocEntry *te);
@@ -78,13 +80,6 @@ typedef struct
 	ArchiveHandle *AH;
 } TAR_MEMBER;
 
-/*
- * Maximum file size for a tar member: The limit inherent in the
- * format is 2^33-1 bytes (nearly 8 GB).  But we don't want to exceed
- * what we can represent in pgoff_t.
- */
-#define MAX_TAR_MEMBER_FILELEN (((int64) 1 << Min(33, sizeof(pgoff_t)*8 - 1)) - 1)
-
 typedef struct
 {
 	int			hasSeek;
@@ -107,7 +102,7 @@ typedef struct
 /* translator: this is a module name */
 static const char *modulename = gettext_noop("tar archiver");
 
-static void _LoadBlobs(ArchiveHandle *AH, RestoreOptions *ropt);
+static void _LoadBlobs(ArchiveHandle *AH);
 
 static TAR_MEMBER *tarOpen(ArchiveHandle *AH, const char *filename, char mode);
 static void tarClose(ArchiveHandle *AH, TAR_MEMBER *TH);
@@ -158,9 +153,6 @@ InitArchiveFmt_Tar(ArchiveHandle *AH)
 	AH->ClonePtr = NULL;
 	AH->DeClonePtr = NULL;
 
-	AH->MasterStartParallelItemPtr = NULL;
-	AH->MasterEndParallelItemPtr = NULL;
-
 	AH->WorkerJobDumpPtr = NULL;
 	AH->WorkerJobRestorePtr = NULL;
 
@@ -186,7 +178,7 @@ InitArchiveFmt_Tar(ArchiveHandle *AH)
 			ctx->tarFH = fopen(AH->fSpec, PG_BINARY_W);
 			if (ctx->tarFH == NULL)
 				exit_horribly(modulename,
-						   "could not open TOC file \"%s\" for output: %s\n",
+							  "could not open TOC file \"%s\" for output: %s\n",
 							  AH->fSpec, strerror(errno));
 		}
 		else
@@ -215,7 +207,7 @@ InitArchiveFmt_Tar(ArchiveHandle *AH)
 		 */
 		if (AH->compression != 0)
 			exit_horribly(modulename,
-					 "compression is not supported by tar archive format\n");
+						  "compression is not supported by tar archive format\n");
 	}
 	else
 	{							/* Read Mode */
@@ -343,7 +335,7 @@ tarOpen(ArchiveHandle *AH, const char *filename, char mode)
 	TAR_MEMBER *tm;
 
 #ifdef HAVE_LIBZ
-	char		fmode[10];
+	char		fmode[14];
 #endif
 
 	if (mode == 'r')
@@ -563,8 +555,20 @@ _tarReadRaw(ArchiveHandle *AH, void *buf, size_t len, TAR_MEMBER *th, FILE *fh)
 			{
 				res = GZREAD(&((char *) buf)[used], 1, len, th->zFH);
 				if (res != len && !GZEOF(th->zFH))
+				{
+#ifdef HAVE_LIBZ
+					int			errnum;
+					const char *errmsg = gzerror(th->zFH, &errnum);
+
 					exit_horribly(modulename,
-					"could not read from input file: %s\n", strerror(errno));
+								  "could not read from input file: %s\n",
+								  errnum == Z_ERRNO ? strerror(errno) : errmsg);
+#else
+					exit_horribly(modulename,
+								  "could not read from input file: %s\n",
+								  strerror(errno));
+#endif
+				}
 			}
 			else
 			{
@@ -639,7 +643,7 @@ _EndData(ArchiveHandle *AH, TocEntry *te)
  * Print data for a given file
  */
 static void
-_PrintFileData(ArchiveHandle *AH, char *filename, RestoreOptions *ropt)
+_PrintFileData(ArchiveHandle *AH, char *filename)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 	char		buf[4096];
@@ -666,7 +670,7 @@ _PrintFileData(ArchiveHandle *AH, char *filename, RestoreOptions *ropt)
  * Print data for a given TOC entry
 */
 static void
-_PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
+_PrintTocData(ArchiveHandle *AH, TocEntry *te)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 	lclTocEntry *tctx = (lclTocEntry *) te->formatData;
@@ -715,13 +719,13 @@ _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
 	}
 
 	if (strcmp(te->desc, "BLOBS") == 0)
-		_LoadBlobs(AH, ropt);
+		_LoadBlobs(AH);
 	else
-		_PrintFileData(AH, tctx->filename, ropt);
+		_PrintFileData(AH, tctx->filename);
 }
 
 static void
-_LoadBlobs(ArchiveHandle *AH, RestoreOptions *ropt)
+_LoadBlobs(ArchiveHandle *AH)
 {
 	Oid			oid;
 	lclContext *ctx = (lclContext *) AH->formatData;
@@ -744,7 +748,7 @@ _LoadBlobs(ArchiveHandle *AH, RestoreOptions *ropt)
 			{
 				ahlog(AH, 1, "restoring large object with OID %u\n", oid);
 
-				StartRestoreBlob(AH, oid, ropt->dropSchema);
+				StartRestoreBlob(AH, oid, AH->public.ropt->dropSchema);
 
 				while ((cnt = tarRead(buf, 4095, th)) > 0)
 				{
@@ -831,12 +835,13 @@ _ReadBuf(ArchiveHandle *AH, void *buf, size_t len)
 }
 
 static void
-_CloseArchive(ArchiveHandle *AH, DumpOptions *dopt)
+_CloseArchive(ArchiveHandle *AH)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 	TAR_MEMBER *th;
 	RestoreOptions *ropt;
 	RestoreOptions *savRopt;
+	DumpOptions *savDopt;
 	int			savVerbose,
 				i;
 
@@ -854,7 +859,7 @@ _CloseArchive(ArchiveHandle *AH, DumpOptions *dopt)
 		/*
 		 * Now send the data (tables & blobs)
 		 */
-		WriteDataChunks(AH, dopt, NULL);
+		WriteDataChunks(AH, NULL);
 
 		/*
 		 * Now this format wants to append a script which does a full restore
@@ -876,22 +881,25 @@ _CloseArchive(ArchiveHandle *AH, DumpOptions *dopt)
 		ctx->scriptTH = th;
 
 		ropt = NewRestoreOptions();
-		memcpy(ropt, AH->ropt, sizeof(RestoreOptions));
+		memcpy(ropt, AH->public.ropt, sizeof(RestoreOptions));
 		ropt->filename = NULL;
 		ropt->dropSchema = 1;
 		ropt->compression = 0;
 		ropt->superuser = NULL;
 		ropt->suppressDumpWarnings = true;
 
-		savRopt = AH->ropt;
-		AH->ropt = ropt;
+		savDopt = AH->public.dopt;
+		savRopt = AH->public.ropt;
+
+		SetArchiveOptions((Archive *) AH, NULL, ropt);
 
 		savVerbose = AH->public.verbose;
 		AH->public.verbose = 0;
 
 		RestoreArchive((Archive *) AH);
 
-		AH->ropt = savRopt;
+		SetArchiveOptions((Archive *) AH, savDopt, savRopt);
+
 		AH->public.verbose = savVerbose;
 
 		tarClose(AH, th);
@@ -906,6 +914,10 @@ _CloseArchive(ArchiveHandle *AH, DumpOptions *dopt)
 			if (fputc(0, ctx->tarFH) == EOF)
 				WRITE_ERROR_EXIT;
 		}
+
+		/* Sync the output file if one is defined */
+		if (AH->dosync && AH->fSpec)
+			(void) fsync_fname(AH->fSpec, false, progname);
 	}
 
 	AH->FH = NULL;
@@ -1014,6 +1026,7 @@ _EndBlobs(ArchiveHandle *AH, TocEntry *te)
 static int
 tarPrintf(ArchiveHandle *AH, TAR_MEMBER *th, const char *fmt,...)
 {
+	int			save_errno = errno;
 	char	   *p;
 	size_t		len = 128;		/* initial assumption about buffer size */
 	size_t		cnt;
@@ -1026,6 +1039,7 @@ tarPrintf(ArchiveHandle *AH, TAR_MEMBER *th, const char *fmt,...)
 		p = (char *) pg_malloc(len);
 
 		/* Try to format the data. */
+		errno = save_errno;
 		va_start(args, fmt);
 		cnt = pvsnprintf(p, len, fmt, args);
 		va_end(args);
@@ -1049,7 +1063,7 @@ isValidTarHeader(char *header)
 	int			sum;
 	int			chk = tarChecksum(header);
 
-	sscanf(&header[148], "%8o", &sum);
+	sum = read_tar_number(&header[148], 8);
 
 	if (sum != chk)
 		return false;
@@ -1090,13 +1104,6 @@ _tarAddFile(ArchiveHandle *AH, TAR_MEMBER *th)
 		exit_horribly(modulename, "could not determine seek position in archive file: %s\n",
 					  strerror(errno));
 	fseeko(tmp, 0, SEEK_SET);
-
-	/*
-	 * Some compilers will throw a warning knowing this test can never be true
-	 * because pgoff_t can't exceed the compared maximum on their platform.
-	 */
-	if (th->fileLen > MAX_TAR_MEMBER_FILELEN)
-		exit_horribly(modulename, "archive member too large for tar format\n");
 
 	_tarWriteHeader(th);
 
@@ -1200,7 +1207,7 @@ _tarPositionTo(ArchiveHandle *AH, const char *filename)
 						  th->targetFile, filename);
 
 		/* Header doesn't match, so read to next header */
-		len = ((th->fileLen + 511) & ~511);		/* Padded length */
+		len = ((th->fileLen + 511) & ~511); /* Padded length */
 		blks = len >> 9;		/* # of 512 byte blocks */
 
 		for (i = 0; i < blks; i++)
@@ -1222,11 +1229,10 @@ _tarGetHeader(ArchiveHandle *AH, TAR_MEMBER *th)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 	char		h[512];
-	char		tag[100];
+	char		tag[100 + 1];
 	int			sum,
 				chk;
-	size_t		len;
-	unsigned long ullen;
+	pgoff_t		len;
 	pgoff_t		hPos;
 	bool		gotBlock = false;
 
@@ -1243,13 +1249,13 @@ _tarGetHeader(ArchiveHandle *AH, TAR_MEMBER *th)
 		if (len != 512)
 			exit_horribly(modulename,
 						  ngettext("incomplete tar header found (%lu byte)\n",
-								 "incomplete tar header found (%lu bytes)\n",
+								   "incomplete tar header found (%lu bytes)\n",
 								   len),
 						  (unsigned long) len);
 
 		/* Calc checksum */
 		chk = tarChecksum(h);
-		sscanf(&h[148], "%8o", &sum);
+		sum = read_tar_number(&h[148], 8);
 
 		/*
 		 * If the checksum failed, see if it is a null block. If so, silently
@@ -1272,27 +1278,31 @@ _tarGetHeader(ArchiveHandle *AH, TAR_MEMBER *th)
 		}
 	}
 
-	sscanf(&h[0], "%99s", tag);
-	sscanf(&h[124], "%12lo", &ullen);
-	len = (size_t) ullen;
+	/* Name field is 100 bytes, might not be null-terminated */
+	strlcpy(tag, &h[0], 100 + 1);
+
+	len = read_tar_number(&h[124], 12);
 
 	{
-		char		buf[100];
+		char		posbuf[32];
+		char		lenbuf[32];
 
-		snprintf(buf, sizeof(buf), INT64_FORMAT, (int64) hPos);
-		ahlog(AH, 3, "TOC Entry %s at %s (length %lu, checksum %d)\n",
-			  tag, buf, (unsigned long) len, sum);
+		snprintf(posbuf, sizeof(posbuf), UINT64_FORMAT, (uint64) hPos);
+		snprintf(lenbuf, sizeof(lenbuf), UINT64_FORMAT, (uint64) len);
+		ahlog(AH, 3, "TOC Entry %s at %s (length %s, checksum %d)\n",
+			  tag, posbuf, lenbuf, sum);
 	}
 
 	if (chk != sum)
 	{
-		char		buf[100];
+		char		posbuf[32];
 
-		snprintf(buf, sizeof(buf), INT64_FORMAT, (int64) ftello(ctx->tarFH));
+		snprintf(posbuf, sizeof(posbuf), UINT64_FORMAT,
+				 (uint64) ftello(ctx->tarFH));
 		exit_horribly(modulename,
 					  "corrupt tar header found in %s "
 					  "(expected %d, computed %d) file position %s\n",
-					  tag, sum, chk, buf);
+					  tag, sum, chk, posbuf);
 	}
 
 	th->targetFile = pg_strdup(tag);
@@ -1307,7 +1317,8 @@ _tarWriteHeader(TAR_MEMBER *th)
 {
 	char		h[512];
 
-	tarCreateHeader(h, th->targetFile, NULL, th->fileLen, 0600, 04000, 02000, time(NULL));
+	tarCreateHeader(h, th->targetFile, NULL, th->fileLen,
+					0600, 04000, 02000, time(NULL));
 
 	/* Now write the completed header. */
 	if (fwrite(h, 1, 512, th->tarFH) != 512)

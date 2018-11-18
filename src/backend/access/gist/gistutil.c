@@ -4,7 +4,7 @@
  *	  utilities routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,10 +16,14 @@
 #include <math.h>
 
 #include "access/gist_private.h"
+#include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "catalog/pg_opclass.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
-#include "utils/builtins.h"
+#include "utils/float.h"
+#include "utils/syscache.h"
+#include "utils/lsyscache.h"
 
 
 /*
@@ -175,7 +179,7 @@ gistMakeUnionItVec(GISTSTATE *giststate, IndexTuple *itvec, int len,
 						   evec->vector + evec->n,
 						   datum,
 						   NULL, NULL, (OffsetNumber) 0,
-						   FALSE, IsNull);
+						   false, IsNull);
 			evec->n++;
 		}
 
@@ -183,7 +187,7 @@ gistMakeUnionItVec(GISTSTATE *giststate, IndexTuple *itvec, int len,
 		if (evec->n == 0)
 		{
 			attr[i] = (Datum) 0;
-			isnull[i] = TRUE;
+			isnull[i] = true;
 		}
 		else
 		{
@@ -200,7 +204,7 @@ gistMakeUnionItVec(GISTSTATE *giststate, IndexTuple *itvec, int len,
 										PointerGetDatum(evec),
 										PointerGetDatum(&attrsize));
 
-			isnull[i] = FALSE;
+			isnull[i] = false;
 		}
 	}
 }
@@ -242,17 +246,17 @@ gistMakeUnionKey(GISTSTATE *giststate, int attno,
 
 	if (isnull1 && isnull2)
 	{
-		*dstisnull = TRUE;
+		*dstisnull = true;
 		*dst = (Datum) 0;
 	}
 	else
 	{
-		if (isnull1 == FALSE && isnull2 == FALSE)
+		if (isnull1 == false && isnull2 == false)
 		{
 			evec->vector[0] = *entry1;
 			evec->vector[1] = *entry2;
 		}
-		else if (isnull1 == FALSE)
+		else if (isnull1 == false)
 		{
 			evec->vector[0] = *entry1;
 			evec->vector[1] = *entry1;
@@ -263,7 +267,7 @@ gistMakeUnionKey(GISTSTATE *giststate, int attno,
 			evec->vector[1] = *entry2;
 		}
 
-		*dstisnull = FALSE;
+		*dstisnull = false;
 		*dst = FunctionCall2Coll(&giststate->unionFn[attno],
 								 giststate->supportCollation[attno],
 								 PointerGetDatum(evec),
@@ -299,7 +303,7 @@ gistDeCompressAtt(GISTSTATE *giststate, Relation r, IndexTuple tuple, Page p,
 		datum = index_getattr(tuple, i + 1, giststate->tupdesc, &isnull[i]);
 		gistdentryinit(giststate, i, &attdata[i],
 					   datum, r, p, o,
-					   FALSE, isnull[i]);
+					   false, isnull[i]);
 	}
 }
 
@@ -309,7 +313,7 @@ gistDeCompressAtt(GISTSTATE *giststate, Relation r, IndexTuple tuple, Page p,
 IndexTuple
 gistgetadjusted(Relation r, IndexTuple oldtup, IndexTuple addtup, GISTSTATE *giststate)
 {
-	bool		neednew = FALSE;
+	bool		neednew = false;
 	GISTENTRY	oldentries[INDEX_MAX_KEYS],
 				addentries[INDEX_MAX_KEYS];
 	bool		oldisnull[INDEX_MAX_KEYS],
@@ -447,7 +451,7 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 			/* Compute penalty for this column. */
 			datum = index_getattr(itup, j + 1, giststate->tupdesc, &IsNull);
 			gistdentryinit(giststate, j, &entry, datum, r, p, i,
-						   FALSE, IsNull);
+						   false, IsNull);
 			usize = gistpenalty(giststate, j, &entry, IsNull,
 								&identry[j], isnull[j]);
 			if (usize > 0)
@@ -546,9 +550,14 @@ gistdentryinit(GISTSTATE *giststate, int nkey, GISTENTRY *e,
 		GISTENTRY  *dep;
 
 		gistentryinit(*e, k, r, pg, o, l);
+
+		/* there may not be a decompress function in opclass */
+		if (!OidIsValid(giststate->decompressFn[nkey].fn_oid))
+			return;
+
 		dep = (GISTENTRY *)
 			DatumGetPointer(FunctionCall1Coll(&giststate->decompressFn[nkey],
-										   giststate->supportCollation[nkey],
+											  giststate->supportCollation[nkey],
 											  PointerGetDatum(e)));
 		/* decompressFn may just return the given pointer */
 		if (dep != e)
@@ -581,10 +590,14 @@ gistFormTuple(GISTSTATE *giststate, Relation r,
 
 			gistentryinit(centry, attdata[i], r, NULL, (OffsetNumber) 0,
 						  isleaf);
-			cep = (GISTENTRY *)
-				DatumGetPointer(FunctionCall1Coll(&giststate->compressFn[i],
-											  giststate->supportCollation[i],
-												  PointerGetDatum(&centry)));
+			/* there may not be a compress function in opclass */
+			if (OidIsValid(giststate->compressFn[i].fn_oid))
+				cep = (GISTENTRY *)
+					DatumGetPointer(FunctionCall1Coll(&giststate->compressFn[i],
+													  giststate->supportCollation[i],
+													  PointerGetDatum(&centry)));
+			else
+				cep = &centry;
 			compatt[i] = cep->key;
 		}
 	}
@@ -621,9 +634,9 @@ gistFetchAtt(GISTSTATE *giststate, int nkey, Datum k, Relation r)
 
 /*
  * Fetch all keys in tuple.
- * returns new IndexTuple that contains GISTENTRY with fetched data
+ * Returns a new HeapTuple containing the originally-indexed data.
  */
-IndexTuple
+HeapTuple
 gistFetchTuple(GISTSTATE *giststate, Relation r, IndexTuple tuple)
 {
 	MemoryContext oldcxt = MemoryContextSwitchTo(giststate->tempCxt);
@@ -644,6 +657,17 @@ gistFetchTuple(GISTSTATE *giststate, Relation r, IndexTuple tuple)
 			else
 				fetchatt[i] = (Datum) 0;
 		}
+		else if (giststate->compressFn[i].fn_oid == InvalidOid)
+		{
+			/*
+			 * If opclass does not provide compress method that could change
+			 * original value, att is necessarily stored in original form.
+			 */
+			if (!isnull[i])
+				fetchatt[i] = datum;
+			else
+				fetchatt[i] = (Datum) 0;
+		}
 		else
 		{
 			/*
@@ -657,7 +681,7 @@ gistFetchTuple(GISTSTATE *giststate, Relation r, IndexTuple tuple)
 	}
 	MemoryContextSwitchTo(oldcxt);
 
-	return index_form_tuple(giststate->fetchTupdesc, fetchatt, isnull);
+	return heap_form_tuple(giststate->fetchTupdesc, fetchatt, isnull);
 }
 
 float
@@ -667,8 +691,8 @@ gistpenalty(GISTSTATE *giststate, int attno,
 {
 	float		penalty = 0.0;
 
-	if (giststate->penaltyFn[attno].fn_strict == FALSE ||
-		(isNullOrig == FALSE && isNullAdd == FALSE))
+	if (giststate->penaltyFn[attno].fn_strict == false ||
+		(isNullOrig == false && isNullAdd == false))
 	{
 		FunctionCall3Coll(&giststate->penaltyFn[attno],
 						  giststate->supportCollation[attno],
@@ -729,9 +753,9 @@ gistcheckpage(Relation rel, Buffer buf)
 	if (PageIsNew(page))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
-			 errmsg("index \"%s\" contains unexpected zero page at block %u",
-					RelationGetRelationName(rel),
-					BufferGetBlockNumber(buf)),
+				 errmsg("index \"%s\" contains unexpected zero page at block %u",
+						RelationGetRelationName(rel),
+						BufferGetBlockNumber(buf)),
 				 errhint("Please REINDEX it.")));
 
 	/*
@@ -808,11 +832,9 @@ gistNewBuffer(Relation r)
 	return buffer;
 }
 
-Datum
-gistoptions(PG_FUNCTION_ARGS)
+bytea *
+gistoptions(Datum reloptions, bool validate)
 {
-	Datum		reloptions = PG_GETARG_DATUM(0);
-	bool		validate = PG_GETARG_BOOL(1);
 	relopt_value *options;
 	GiSTOptions *rdopts;
 	int			numoptions;
@@ -826,7 +848,7 @@ gistoptions(PG_FUNCTION_ARGS)
 
 	/* if none set, we're done */
 	if (numoptions == 0)
-		PG_RETURN_NULL();
+		return NULL;
 
 	rdopts = allocateReloptStruct(sizeof(GiSTOptions), options, numoptions);
 
@@ -835,8 +857,92 @@ gistoptions(PG_FUNCTION_ARGS)
 
 	pfree(options);
 
-	PG_RETURN_BYTEA_P(rdopts);
+	return (bytea *) rdopts;
+}
 
+/*
+ *	gistproperty() -- Check boolean properties of indexes.
+ *
+ * This is optional for most AMs, but is required for GiST because the core
+ * property code doesn't support AMPROP_DISTANCE_ORDERABLE.  We also handle
+ * AMPROP_RETURNABLE here to save opening the rel to call gistcanreturn.
+ */
+bool
+gistproperty(Oid index_oid, int attno,
+			 IndexAMProperty prop, const char *propname,
+			 bool *res, bool *isnull)
+{
+	Oid			opclass,
+				opfamily,
+				opcintype;
+	int16		procno;
+
+	/* Only answer column-level inquiries */
+	if (attno == 0)
+		return false;
+
+	/*
+	 * Currently, GiST distance-ordered scans require that there be a distance
+	 * function in the opclass with the default types (i.e. the one loaded
+	 * into the relcache entry, see initGISTstate).  So we assume that if such
+	 * a function exists, then there's a reason for it (rather than grubbing
+	 * through all the opfamily's operators to find an ordered one).
+	 *
+	 * Essentially the same code can test whether we support returning the
+	 * column data, since that's true if the opclass provides a fetch proc.
+	 */
+
+	switch (prop)
+	{
+		case AMPROP_DISTANCE_ORDERABLE:
+			procno = GIST_DISTANCE_PROC;
+			break;
+		case AMPROP_RETURNABLE:
+			procno = GIST_FETCH_PROC;
+			break;
+		default:
+			return false;
+	}
+
+	/* First we need to know the column's opclass. */
+	opclass = get_index_column_opclass(index_oid, attno);
+	if (!OidIsValid(opclass))
+	{
+		*isnull = true;
+		return true;
+	}
+
+	/* Now look up the opclass family and input datatype. */
+	if (!get_opclass_opfamily_and_input_type(opclass, &opfamily, &opcintype))
+	{
+		*isnull = true;
+		return true;
+	}
+
+	/* And now we can check whether the function is provided. */
+
+	*res = SearchSysCacheExists4(AMPROCNUM,
+								 ObjectIdGetDatum(opfamily),
+								 ObjectIdGetDatum(opcintype),
+								 ObjectIdGetDatum(opcintype),
+								 Int16GetDatum(procno));
+
+	/*
+	 * Special case: even without a fetch function, AMPROP_RETURNABLE is true
+	 * if the opclass has no compress function.
+	 */
+	if (prop == AMPROP_RETURNABLE && !*res)
+	{
+		*res = !SearchSysCacheExists4(AMPROCNUM,
+									  ObjectIdGetDatum(opfamily),
+									  ObjectIdGetDatum(opcintype),
+									  ObjectIdGetDatum(opcintype),
+									  Int16GetDatum(GIST_COMPRESS_PROC));
+	}
+
+	*isnull = false;
+
+	return true;
 }
 
 /*

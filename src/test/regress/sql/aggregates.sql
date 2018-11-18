@@ -51,6 +51,22 @@ select avg(null::float8) from generate_series(1,3);
 select sum('NaN'::numeric) from generate_series(1,3);
 select avg('NaN'::numeric) from generate_series(1,3);
 
+-- verify correct results for infinite inputs
+SELECT avg(x::float8), var_pop(x::float8)
+FROM (VALUES ('1'), ('infinity')) v(x);
+SELECT avg(x::float8), var_pop(x::float8)
+FROM (VALUES ('infinity'), ('1')) v(x);
+SELECT avg(x::float8), var_pop(x::float8)
+FROM (VALUES ('infinity'), ('infinity')) v(x);
+SELECT avg(x::float8), var_pop(x::float8)
+FROM (VALUES ('-infinity'), ('infinity')) v(x);
+
+-- test accuracy with a large input offset
+SELECT avg(x::float8), var_pop(x::float8)
+FROM (VALUES (100000003), (100000004), (100000006), (100000007)) v(x);
+SELECT avg(x::float8), var_pop(x::float8)
+FROM (VALUES (7000000000005), (7000000000007)) v(x);
+
 -- SQL2003 binary aggregates
 SELECT regr_count(b, a) FROM aggtest;
 SELECT regr_sxx(b, a) FROM aggtest;
@@ -62,6 +78,31 @@ SELECT regr_slope(b, a), regr_intercept(b, a) FROM aggtest;
 SELECT covar_pop(b, a), covar_samp(b, a) FROM aggtest;
 SELECT corr(b, a) FROM aggtest;
 
+-- test accum and combine functions directly
+CREATE TABLE regr_test (x float8, y float8);
+INSERT INTO regr_test VALUES (10,150),(20,250),(30,350),(80,540),(100,200);
+SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
+FROM regr_test WHERE x IN (10,20,30,80);
+SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
+FROM regr_test;
+SELECT float8_accum('{4,140,2900}'::float8[], 100);
+SELECT float8_regr_accum('{4,140,2900,1290,83075,15050}'::float8[], 200, 100);
+SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
+FROM regr_test WHERE x IN (10,20,30);
+SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
+FROM regr_test WHERE x IN (80,100);
+SELECT float8_combine('{3,60,200}'::float8[], '{0,0,0}'::float8[]);
+SELECT float8_combine('{0,0,0}'::float8[], '{2,180,200}'::float8[]);
+SELECT float8_combine('{3,60,200}'::float8[], '{2,180,200}'::float8[]);
+SELECT float8_regr_combine('{3,60,200,750,20000,2000}'::float8[],
+                           '{0,0,0,0,0,0}'::float8[]);
+SELECT float8_regr_combine('{0,0,0,0,0,0}'::float8[],
+                           '{2,180,200,740,57800,-3400}'::float8[]);
+SELECT float8_regr_combine('{3,60,200,750,20000,2000}'::float8[],
+                           '{2,180,200,740,57800,-3400}'::float8[]);
+DROP TABLE regr_test;
+
+-- test count, distinct
 SELECT count(four) AS cnt_1000 FROM onek;
 SELECT count(DISTINCT four) AS cnt_4 FROM onek;
 
@@ -97,6 +138,28 @@ having exists (select 1 from onek b
 select
   (select max((select i.unique2 from tenk1 i where i.unique1 = o.unique1)))
 from tenk1 o;
+
+-- Test handling of Params within aggregate arguments in hashed aggregation.
+-- Per bug report from Jeevan Chalke.
+explain (verbose, costs off)
+select s1, s2, sm
+from generate_series(1, 3) s1,
+     lateral (select s2, sum(s1 + s2) sm
+              from generate_series(1, 3) s2 group by s2) ss
+order by 1, 2;
+select s1, s2, sm
+from generate_series(1, 3) s1,
+     lateral (select s2, sum(s1 + s2) sm
+              from generate_series(1, 3) s2 group by s2) ss
+order by 1, 2;
+
+explain (verbose, costs off)
+select array(select sum(x+y) s
+            from generate_series(1,3) y group by y order by s)
+  from generate_series(1,3) x;
+select array(select sum(x+y) s
+            from generate_series(1,3) y group by y order by s)
+  from generate_series(1,3) x;
 
 --
 -- test for bitwise integer aggregates
@@ -234,9 +297,17 @@ select max(unique1) from tenk1 where unique1 < 42;
 explain (costs off)
   select max(unique1) from tenk1 where unique1 > 42;
 select max(unique1) from tenk1 where unique1 > 42;
+
+-- the planner may choose a generic aggregate here if parallel query is
+-- enabled, since that plan will be parallel safe and the "optimized"
+-- plan, which has almost identical cost, will not be.  we want to test
+-- the optimized plan, so temporarily disable parallel query.
+begin;
+set local max_parallel_workers_per_gather = 0;
 explain (costs off)
   select max(unique1) from tenk1 where unique1 > 42000;
 select max(unique1) from tenk1 where unique1 > 42000;
+rollback;
 
 -- multi-column index (uses tenk1_thous_tenthous)
 explain (costs off)
@@ -270,6 +341,11 @@ explain (costs off)
   select max(unique2), generate_series(1,3) as g from tenk1 order by g desc;
 select max(unique2), generate_series(1,3) as g from tenk1 order by g desc;
 
+-- interesting corner case: constant gets optimized into a seqscan
+explain (costs off)
+  select max(100) from tenk1;
+select max(100) from tenk1;
+
 -- try it on an inheritance tree
 create table minmaxtest(f1 int);
 create table minmaxtest1() inherits (minmaxtest);
@@ -299,6 +375,37 @@ drop table minmaxtest cascade;
 -- check for correct detection of nested-aggregate errors
 select max(min(unique1)) from tenk1;
 select (select max(min(unique1)) from int8_tbl) from tenk1;
+
+--
+-- Test removal of redundant GROUP BY columns
+--
+
+create temp table t1 (a int, b int, c int, d int, primary key (a, b));
+create temp table t2 (x int, y int, z int, primary key (x, y));
+create temp table t3 (a int, b int, c int, primary key(a, b) deferrable);
+
+-- Non-primary-key columns can be removed from GROUP BY
+explain (costs off) select * from t1 group by a,b,c,d;
+
+-- No removal can happen if the complete PK is not present in GROUP BY
+explain (costs off) select a,c from t1 group by a,c,d;
+
+-- Test removal across multiple relations
+explain (costs off) select *
+from t1 inner join t2 on t1.a = t2.x and t1.b = t2.y
+group by t1.a,t1.b,t1.c,t1.d,t2.x,t2.y,t2.z;
+
+-- Test case where t1 can be optimized but not t2
+explain (costs off) select t1.*,t2.x,t2.z
+from t1 inner join t2 on t1.a = t2.x and t1.b = t2.y
+group by t1.a,t1.b,t1.c,t1.d,t2.x,t2.z;
+
+-- Cannot optimize when PK is deferrable
+explain (costs off) select * from t3 group by a,b,c;
+
+drop table t1;
+drop table t2;
+drop table t3;
 
 --
 -- Test combinations of DISTINCT and/or ORDER BY
@@ -457,6 +564,8 @@ drop table bytea_test_table;
 -- FILTER tests
 
 select min(unique1) filter (where unique1 > 100) from tenk1;
+
+select sum(1/ten) filter (where ten > 0) from tenk1;
 
 select ten, sum(distinct four) filter (where four::text ~ '123') from onek a
 group by ten;
@@ -661,6 +770,9 @@ select my_avg(one),my_avg(one) from (values(1),(3)) t(one);
 -- aggregate state should be shared as transfn is the same for both aggs.
 select my_avg(one),my_sum(one) from (values(1),(3)) t(one);
 
+-- same as previous one, but with DISTINCT, which requires sorting the input.
+select my_avg(distinct one),my_sum(distinct one) from (values(1),(3),(1)) t(one);
+
 -- shouldn't share states due to the distinctness not matching.
 select my_avg(distinct one),my_sum(one) from (values(1),(3)) t(one);
 
@@ -669,6 +781,23 @@ select my_avg(one) filter (where one > 1),my_sum(one) from (values(1),(3)) t(one
 
 -- this should not share the state due to different input columns.
 select my_avg(one),my_sum(two) from (values(1,2),(3,4)) t(one,two);
+
+-- exercise cases where OSAs share state
+select
+  percentile_cont(0.5) within group (order by a),
+  percentile_disc(0.5) within group (order by a)
+from (values(1::float8),(3),(5),(7)) t(a);
+
+select
+  percentile_cont(0.25) within group (order by a),
+  percentile_disc(0.5) within group (order by a)
+from (values(1::float8),(3),(5),(7)) t(a);
+
+-- these can't share state currently
+select
+  rank(4) within group (order by a),
+  dense_rank(4) within group (order by a)
+from (values(1),(3),(5),(7)) t(a);
 
 -- test that aggs with the same sfunc and initcond share the same agg state
 create aggregate my_sum_init(int4)
@@ -755,3 +884,95 @@ create aggregate my_half_sum(int4)
 select my_sum(one),my_half_sum(one) from (values(1),(2),(3),(4)) t(one);
 
 rollback;
+
+
+-- test that the aggregate transition logic correctly handles
+-- transition / combine functions returning NULL
+
+-- First test the case of a normal transition function returning NULL
+BEGIN;
+CREATE FUNCTION balkifnull(int8, int4)
+RETURNS int8
+STRICT
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF $1 IS NULL THEN
+       RAISE 'erroneously called with NULL argument';
+    END IF;
+    RETURN NULL;
+END$$;
+
+CREATE AGGREGATE balk(int4)
+(
+    SFUNC = balkifnull(int8, int4),
+    STYPE = int8,
+    PARALLEL = SAFE,
+    INITCOND = '0'
+);
+
+SELECT balk(hundred) FROM tenk1;
+
+ROLLBACK;
+
+-- Secondly test the case of a parallel aggregate combiner function
+-- returning NULL. For that use normal transition function, but a
+-- combiner function returning NULL.
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+CREATE FUNCTION balkifnull(int8, int8)
+RETURNS int8
+PARALLEL SAFE
+STRICT
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF $1 IS NULL THEN
+       RAISE 'erroneously called with NULL argument';
+    END IF;
+    RETURN NULL;
+END$$;
+
+CREATE AGGREGATE balk(int4)
+(
+    SFUNC = int4_sum(int8, int4),
+    STYPE = int8,
+    COMBINEFUNC = balkifnull(int8, int8),
+    PARALLEL = SAFE,
+    INITCOND = '0'
+);
+
+-- force use of parallelism
+ALTER TABLE tenk1 set (parallel_workers = 4);
+SET LOCAL parallel_setup_cost=0;
+SET LOCAL max_parallel_workers_per_gather=4;
+
+EXPLAIN (COSTS OFF) SELECT balk(hundred) FROM tenk1;
+SELECT balk(hundred) FROM tenk1;
+
+ROLLBACK;
+
+-- test coverage for aggregate combine/serial/deserial functions
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 4;
+SET enable_indexonlyscan = off;
+
+-- variance(int4) covers numeric_poly_combine
+-- sum(int8) covers int8_avg_combine
+EXPLAIN (COSTS OFF)
+  SELECT variance(unique1::int4), sum(unique1::int8) FROM tenk1;
+
+SELECT variance(unique1::int4), sum(unique1::int8) FROM tenk1;
+
+ROLLBACK;
+
+-- test coverage for dense_rank
+SELECT dense_rank(x) WITHIN GROUP (ORDER BY x) FROM (VALUES (1),(1),(2),(2),(3),(3)) v(x) GROUP BY (x) ORDER BY 1;
+
+
+-- Ensure that the STRICT checks for aggregates does not take NULLness
+-- of ORDER BY columns into account. See bug report around
+-- 2a505161-2727-2473-7c46-591ed108ac52@email.cz
+SELECT min(x ORDER BY y) FROM (VALUES(1, NULL)) AS d(x,y);
+SELECT min(x ORDER BY y) FROM (VALUES(1, 2)) AS d(x,y);

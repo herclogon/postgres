@@ -1,5 +1,10 @@
 CREATE EXTENSION ltree;
 
+-- Check whether any of our opclasses fail amvalidate
+SELECT amname, opcname
+FROM pg_opclass opc LEFT JOIN pg_am am ON am.oid = opcmethod
+WHERE opc.oid >= 16384 AND NOT amvalidate(opc.oid);
+
 SELECT ''::ltree;
 SELECT '1'::ltree;
 SELECT '1.2'::ltree;
@@ -49,6 +54,9 @@ SELECT lca('{la.2.3,1.2.3.4.5.6,""}') IS NULL;
 SELECT lca('{la.2.3,1.2.3.4.5.6}') IS NULL;
 SELECT lca('{1.la.2.3,1.2.3.4.5.6}');
 SELECT lca('{1.2.3,1.2.3.4.5.6}');
+SELECT lca('{1.2.3}');
+SELECT lca('{1}'), lca('{1}') IS NULL;
+SELECT lca('{}') IS NULL;
 SELECT lca('1.la.2.3','1.2.3.4.5.6');
 SELECT lca('1.2.3','1.2.3.4.5.6');
 SELECT lca('1.2.2.3','1.2.3.4.5.6');
@@ -204,7 +212,7 @@ SELECT 'a.b.c.d.e'::ltree ? '{A.b.c.d.e, a.*}';
 SELECT '{a.b.c.d.e,B.df}'::ltree[] ? '{A.b.c.d.e}';
 SELECT '{a.b.c.d.e,B.df}'::ltree[] ? '{A.b.c.d.e,*.df}';
 
---exractors
+--extractors
 SELECT ('{3456,1.2.3.34}'::ltree[] ?@> '1.2.3.4') is null;
 SELECT '{3456,1.2.3}'::ltree[] ?@> '1.2.3.4';
 SELECT '{3456,1.2.3.4}'::ltree[] ?<@ '1.2.3';

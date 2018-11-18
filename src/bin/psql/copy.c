@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2015, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2018, PostgreSQL Global Development Group
  *
  * src/bin/psql/copy.c
  */
@@ -18,7 +18,6 @@
 
 #include "libpq-fe.h"
 #include "pqexpbuffer.h"
-#include "dumputils.h"
 
 #include "settings.h"
 #include "common.h"
@@ -32,10 +31,12 @@
  *
  * The documented syntax is:
  *	\copy tablename [(columnlist)] from|to filename [options]
- *	\copy ( select stmt ) to filename [options]
+ *	\copy ( query stmt ) to filename [options]
  *
  * where 'filename' can be one of the following:
  *	'<file path>' | PROGRAM '<command>' | stdin | stdout | pstdout | pstdout
+ * and 'query' can be one of the following:
+ *	SELECT | UPDATE | INSERT | DELETE
  *
  * An undocumented fact is that you can still write BINARY before the
  * tablename; this is a hangover from the pre-7.3 syntax.  The options
@@ -62,7 +63,7 @@ struct copy_options
 
 
 static void
-free_copy_options(struct copy_options * ptr)
+free_copy_options(struct copy_options *ptr)
 {
 	if (!ptr)
 		return;
@@ -101,7 +102,7 @@ parse_slash_copy(const char *args)
 
 	result = pg_malloc0(sizeof(struct copy_options));
 
-	result->before_tofrom = pg_strdup("");		/* initialize for appending */
+	result->before_tofrom = pg_strdup("");	/* initialize for appending */
 
 	token = strtokx(args, whitespace, ".,()", "\"",
 					0, false, false, pset.encoding);
@@ -118,7 +119,7 @@ parse_slash_copy(const char *args)
 			goto error;
 	}
 
-	/* Handle COPY (SELECT) case */
+	/* Handle COPY (query) case */
 	if (token[0] == '(')
 	{
 		int			parens = 1;
@@ -310,9 +311,7 @@ do_copy(const char *args)
 				fflush(stdout);
 				fflush(stderr);
 				errno = 0;
-#ifndef WIN32
-				pqsignal(SIGPIPE, SIG_IGN);
-#endif
+				disable_sigpipe_trap();
 				copystream = popen(options->file, PG_BINARY_W);
 			}
 			else
@@ -397,9 +396,7 @@ do_copy(const char *args)
 				}
 				success = false;
 			}
-#ifndef WIN32
-			pqsignal(SIGPIPE, SIG_DFL);
-#endif
+			restore_sigpipe_trap();
 		}
 		else
 		{
@@ -543,7 +540,7 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 		showprompt = true;
 		if (!pset.quiet)
 			puts(_("Enter data to be copied followed by a newline.\n"
-				   "End with a backslash and a period on a line by itself."));
+				   "End with a backslash and a period on a line by itself, or an EOF signal."));
 	}
 	else
 		showprompt = false;
@@ -555,7 +552,7 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 		/* interactive input probably silly, but give one prompt anyway */
 		if (showprompt)
 		{
-			const char *prompt = get_prompt(PROMPT_COPY);
+			const char *prompt = get_prompt(PROMPT_COPY, NULL);
 
 			fputs(prompt, stdout);
 			fflush(stdout);
@@ -593,7 +590,7 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 
 			if (showprompt)
 			{
-				const char *prompt = get_prompt(PROMPT_COPY);
+				const char *prompt = get_prompt(PROMPT_COPY, NULL);
 
 				fputs(prompt, stdout);
 				fflush(stdout);
@@ -632,8 +629,7 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 					/*
 					 * This code erroneously assumes '\.' on a line alone
 					 * inside a quoted CSV string terminates the \copy.
-					 * http://www.postgresql.org/message-id/E1TdNVQ-0001ju-GO@w
-					 * rigleys.postgresql.org
+					 * http://www.postgresql.org/message-id/E1TdNVQ-0001ju-GO@wrigleys.postgresql.org
 					 */
 					if (strcmp(buf, "\\.\n") == 0 ||
 						strcmp(buf, "\\.\r\n") == 0)
@@ -675,6 +671,16 @@ handleCopyIn(PGconn *conn, FILE *copystream, bool isbinary, PGresult **res)
 		OK = false;
 
 copyin_cleanup:
+
+	/*
+	 * Clear the EOF flag on the stream, in case copying ended due to an EOF
+	 * signal.  This allows an interactive TTY session to perform another COPY
+	 * FROM STDIN later.  (In non-STDIN cases, we're about to close the file
+	 * anyway, so it doesn't matter.)  Although we don't ever test the flag
+	 * with feof(), some fread() implementations won't read more data if it's
+	 * set.  This also clears the error flag, but we already checked that.
+	 */
+	clearerr(copystream);
 
 	/*
 	 * Check command status and return to normal libpq state.

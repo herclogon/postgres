@@ -3,7 +3,7 @@
  * regexp.c
  *	  Postgres' interface to the regular expression package.
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,6 +35,8 @@
 #include "regex/regex.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
+#include "utils/varlena.h"
 
 #define PG_GETARG_TEXT_PP_IF_EXISTS(_n) \
 	(PG_NARGS() > (_n) ? PG_GETARG_TEXT_PP(_n) : NULL)
@@ -47,7 +49,7 @@ typedef struct pg_re_flags
 	bool		glob;			/* do it globally (for each occurrence) */
 } pg_re_flags;
 
-/* cross-call state for regexp_matches(), also regexp_split() */
+/* cross-call state for regexp_match and regexp_split functions */
 typedef struct regexp_matches_ctx
 {
 	text	   *orig_str;		/* data string in original TEXT form */
@@ -57,9 +59,12 @@ typedef struct regexp_matches_ctx
 	/* so the number of entries in match_locs is nmatches * npatterns * 2 */
 	int		   *match_locs;		/* 0-based character indexes */
 	int			next_match;		/* 0-based index of next match to process */
-	/* workspace for build_regexp_matches_result() */
+	/* workspace for build_regexp_match_result() */
 	Datum	   *elems;			/* has npatterns elements */
 	bool	   *nulls;			/* has npatterns elements */
+	pg_wchar   *wide_str;		/* wide-char version of original string */
+	char	   *conv_buf;		/* conversion buffer */
+	int			conv_bufsiz;	/* size thereof */
 } regexp_matches_ctx;
 
 /*
@@ -107,13 +112,12 @@ static cached_re_str re_array[MAX_CACHED_RES];	/* cached re's */
 
 /* Local functions */
 static regexp_matches_ctx *setup_regexp_matches(text *orig_str, text *pattern,
-					 text *flags,
+					 pg_re_flags *flags,
 					 Oid collation,
-					 bool force_glob,
 					 bool use_subpatterns,
-					 bool ignore_degenerate);
-static void cleanup_regexp_matches(regexp_matches_ctx *matchctx);
-static ArrayType *build_regexp_matches_result(regexp_matches_ctx *matchctx);
+					 bool ignore_degenerate,
+					 bool fetching_unmatched);
+static ArrayType *build_regexp_match_result(regexp_matches_ctx *matchctx);
 static Datum build_regexp_split_result(regexp_matches_ctx *splitctx);
 
 
@@ -247,7 +251,7 @@ RE_compile_and_cache(text *text_re, int cflags, Oid collation)
 /*
  * RE_wchar_execute - execute a RE on pg_wchar data
  *
- * Returns TRUE on match, FALSE on no match
+ * Returns true on match, false on no match
  *
  *	re --- the compiled pattern as returned by RE_compile_and_cache
  *	data --- the data to match against (need not be null-terminated)
@@ -291,7 +295,7 @@ RE_wchar_execute(regex_t *re, pg_wchar *data, int data_len,
 /*
  * RE_execute - execute a RE
  *
- * Returns TRUE on match, FALSE on no match
+ * Returns true on match, false on no match
  *
  *	re --- the compiled pattern as returned by RE_compile_and_cache
  *	dat --- the data to match against (need not be null-terminated)
@@ -323,7 +327,7 @@ RE_execute(regex_t *re, char *dat, int dat_len,
 /*
  * RE_compile_and_execute - compile and execute a RE
  *
- * Returns TRUE on match, FALSE on no match
+ * Returns true on match, false on no match
  *
  *	text_re --- the pattern, expressed as a TEXT object
  *	dat --- the data to match against (need not be null-terminated)
@@ -350,7 +354,7 @@ RE_compile_and_execute(text *text_re, char *dat, int dat_len,
 
 
 /*
- * parse_re_flags - parse the options argument of regexp_matches and friends
+ * parse_re_flags - parse the options argument of regexp_match and friends
  *
  *	flags --- output argument, filled with desired options
  *	opts --- TEXT object, or NULL for defaults
@@ -696,7 +700,7 @@ similar_escape(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_ESCAPE_SEQUENCE),
 						 errmsg("invalid escape string"),
-				  errhint("Escape string must be empty or one character.")));
+						 errhint("Escape string must be empty or one character.")));
 		}
 	}
 
@@ -841,8 +845,52 @@ similar_escape(PG_FUNCTION_ARGS)
 }
 
 /*
+ * regexp_match()
+ *		Return the first substring(s) matching a pattern within a string.
+ */
+Datum
+regexp_match(PG_FUNCTION_ARGS)
+{
+	text	   *orig_str = PG_GETARG_TEXT_PP(0);
+	text	   *pattern = PG_GETARG_TEXT_PP(1);
+	text	   *flags = PG_GETARG_TEXT_PP_IF_EXISTS(2);
+	pg_re_flags re_flags;
+	regexp_matches_ctx *matchctx;
+
+	/* Determine options */
+	parse_re_flags(&re_flags, flags);
+	/* User mustn't specify 'g' */
+	if (re_flags.glob)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("regexp_match does not support the global option"),
+				 errhint("Use the regexp_matches function instead.")));
+
+	matchctx = setup_regexp_matches(orig_str, pattern, &re_flags,
+									PG_GET_COLLATION(), true, false, false);
+
+	if (matchctx->nmatches == 0)
+		PG_RETURN_NULL();
+
+	Assert(matchctx->nmatches == 1);
+
+	/* Create workspace that build_regexp_match_result needs */
+	matchctx->elems = (Datum *) palloc(sizeof(Datum) * matchctx->npatterns);
+	matchctx->nulls = (bool *) palloc(sizeof(bool) * matchctx->npatterns);
+
+	PG_RETURN_DATUM(PointerGetDatum(build_regexp_match_result(matchctx)));
+}
+
+/* This is separate to keep the opr_sanity regression test from complaining */
+Datum
+regexp_match_no_flags(PG_FUNCTION_ARGS)
+{
+	return regexp_match(fcinfo);
+}
+
+/*
  * regexp_matches()
- *		Return a table of matches of a pattern within a string.
+ *		Return a table of all matches of a pattern within a string.
  */
 Datum
 regexp_matches(PG_FUNCTION_ARGS)
@@ -854,18 +902,22 @@ regexp_matches(PG_FUNCTION_ARGS)
 	{
 		text	   *pattern = PG_GETARG_TEXT_PP(1);
 		text	   *flags = PG_GETARG_TEXT_PP_IF_EXISTS(2);
+		pg_re_flags re_flags;
 		MemoryContext oldcontext;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
+		/* Determine options */
+		parse_re_flags(&re_flags, flags);
+
 		/* be sure to copy the input string into the multi-call ctx */
 		matchctx = setup_regexp_matches(PG_GETARG_TEXT_P_COPY(0), pattern,
-										flags,
+										&re_flags,
 										PG_GET_COLLATION(),
-										false, true, false);
+										true, false, false);
 
-		/* Pre-create workspace that build_regexp_matches_result needs */
+		/* Pre-create workspace that build_regexp_match_result needs */
 		matchctx->elems = (Datum *) palloc(sizeof(Datum) * matchctx->npatterns);
 		matchctx->nulls = (bool *) palloc(sizeof(bool) * matchctx->npatterns);
 
@@ -880,13 +932,10 @@ regexp_matches(PG_FUNCTION_ARGS)
 	{
 		ArrayType  *result_ary;
 
-		result_ary = build_regexp_matches_result(matchctx);
+		result_ary = build_regexp_match_result(matchctx);
 		matchctx->next_match++;
 		SRF_RETURN_NEXT(funcctx, PointerGetDatum(result_ary));
 	}
-
-	/* release space in multi-call ctx to avoid intraquery memory leak */
-	cleanup_regexp_matches(matchctx);
 
 	SRF_RETURN_DONE(funcctx);
 }
@@ -899,35 +948,43 @@ regexp_matches_no_flags(PG_FUNCTION_ARGS)
 }
 
 /*
- * setup_regexp_matches --- do the initial matching for regexp_matches()
- *		or regexp_split()
+ * setup_regexp_matches --- do the initial matching for regexp_match
+ *		and regexp_split functions
  *
  * To avoid having to re-find the compiled pattern on each call, we do
  * all the matching in one swoop.  The returned regexp_matches_ctx contains
  * the locations of all the substrings matching the pattern.
  *
- * The three bool parameters have only two patterns (one for each caller)
- * but it seems clearer to distinguish the functionality this way than to
- * key it all off one "is_split" flag.
+ * The three bool parameters have only two patterns (one for matching, one for
+ * splitting) but it seems clearer to distinguish the functionality this way
+ * than to key it all off one "is_split" flag. We don't currently assume that
+ * fetching_unmatched is exclusive of fetching the matched text too; if it's
+ * set, the conversion buffer is large enough to fetch any single matched or
+ * unmatched string, but not any larger substring. (In practice, when splitting
+ * the matches are usually small anyway, and it didn't seem worth complicating
+ * the code further.)
  */
 static regexp_matches_ctx *
-setup_regexp_matches(text *orig_str, text *pattern, text *flags,
+setup_regexp_matches(text *orig_str, text *pattern, pg_re_flags *re_flags,
 					 Oid collation,
-					 bool force_glob, bool use_subpatterns,
-					 bool ignore_degenerate)
+					 bool use_subpatterns,
+					 bool ignore_degenerate,
+					 bool fetching_unmatched)
 {
 	regexp_matches_ctx *matchctx = palloc0(sizeof(regexp_matches_ctx));
+	int			eml = pg_database_encoding_max_length();
 	int			orig_len;
 	pg_wchar   *wide_str;
 	int			wide_len;
-	pg_re_flags re_flags;
 	regex_t    *cpattern;
 	regmatch_t *pmatch;
 	int			pmatch_len;
 	int			array_len;
 	int			array_idx;
 	int			prev_match_end;
+	int			prev_valid_match_end;
 	int			start_search;
+	int			maxlen = 0;		/* largest fetch length in characters */
 
 	/* save original string --- we'll extract result substrings from it */
 	matchctx->orig_str = orig_str;
@@ -937,21 +994,8 @@ setup_regexp_matches(text *orig_str, text *pattern, text *flags,
 	wide_str = (pg_wchar *) palloc(sizeof(pg_wchar) * (orig_len + 1));
 	wide_len = pg_mb2wchar_with_len(VARDATA_ANY(orig_str), wide_str, orig_len);
 
-	/* determine options */
-	parse_re_flags(&re_flags, flags);
-	if (force_glob)
-	{
-		/* user mustn't specify 'g' for regexp_split */
-		if (re_flags.glob)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("regexp_split does not support the global option")));
-		/* but we find all the matches anyway */
-		re_flags.glob = true;
-	}
-
 	/* set up the compiled pattern */
-	cpattern = RE_compile_and_cache(pattern, re_flags.cflags, collation);
+	cpattern = RE_compile_and_cache(pattern, re_flags->cflags, collation);
 
 	/* do we want to remember subpatterns? */
 	if (use_subpatterns && cpattern->re_nsub > 0)
@@ -969,13 +1013,19 @@ setup_regexp_matches(text *orig_str, text *pattern, text *flags,
 	/* temporary output space for RE package */
 	pmatch = palloc(sizeof(regmatch_t) * pmatch_len);
 
-	/* the real output space (grown dynamically if needed) */
-	array_len = re_flags.glob ? 256 : 32;
+	/*
+	 * the real output space (grown dynamically if needed)
+	 *
+	 * use values 2^n-1, not 2^n, so that we hit the limit at 2^28-1 rather
+	 * than at 2^27
+	 */
+	array_len = re_flags->glob ? 255 : 31;
 	matchctx->match_locs = (int *) palloc(sizeof(int) * array_len);
 	array_idx = 0;
 
 	/* search for the pattern, perhaps repeatedly */
 	prev_match_end = 0;
+	prev_valid_match_end = 0;
 	start_search = 0;
 	while (RE_wchar_execute(cpattern, wide_str, wide_len, start_search,
 							pmatch_len, pmatch))
@@ -990,11 +1040,15 @@ setup_regexp_matches(text *orig_str, text *pattern, text *flags,
 			 pmatch[0].rm_eo > prev_match_end))
 		{
 			/* enlarge output space if needed */
-			while (array_idx + matchctx->npatterns * 2 > array_len)
+			while (array_idx + matchctx->npatterns * 2 + 1 > array_len)
 			{
-				array_len *= 2;
+				array_len += array_len + 1;		/* 2^n-1 => 2^(n+1)-1 */
+				if (array_len > MaxAllocSize/sizeof(int))
+					ereport(ERROR,
+							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							 errmsg("too many regular expression matches")));
 				matchctx->match_locs = (int *) repalloc(matchctx->match_locs,
-													sizeof(int) * array_len);
+														sizeof(int) * array_len);
 			}
 
 			/* save this match's locations */
@@ -1004,21 +1058,40 @@ setup_regexp_matches(text *orig_str, text *pattern, text *flags,
 
 				for (i = 1; i <= matchctx->npatterns; i++)
 				{
-					matchctx->match_locs[array_idx++] = pmatch[i].rm_so;
-					matchctx->match_locs[array_idx++] = pmatch[i].rm_eo;
+					int		so = pmatch[i].rm_so;
+					int		eo = pmatch[i].rm_eo;
+					matchctx->match_locs[array_idx++] = so;
+					matchctx->match_locs[array_idx++] = eo;
+					if (so >= 0 && eo >= 0 && (eo - so) > maxlen)
+						maxlen = (eo - so);
 				}
 			}
 			else
 			{
-				matchctx->match_locs[array_idx++] = pmatch[0].rm_so;
-				matchctx->match_locs[array_idx++] = pmatch[0].rm_eo;
+				int		so = pmatch[0].rm_so;
+				int		eo = pmatch[0].rm_eo;
+				matchctx->match_locs[array_idx++] = so;
+				matchctx->match_locs[array_idx++] = eo;
+				if (so >= 0 && eo >= 0 && (eo - so) > maxlen)
+					maxlen = (eo - so);
 			}
 			matchctx->nmatches++;
+
+			/*
+			 * check length of unmatched portion between end of previous valid
+			 * (nondegenerate, or degenerate but not ignored) match and start
+			 * of current one
+			 */
+			if (fetching_unmatched &&
+				pmatch[0].rm_so >= 0 &&
+				(pmatch[0].rm_so - prev_valid_match_end) > maxlen)
+				maxlen = (pmatch[0].rm_so - prev_valid_match_end);
+			prev_valid_match_end = pmatch[0].rm_eo;
 		}
 		prev_match_end = pmatch[0].rm_eo;
 
 		/* if not glob, stop after one match */
-		if (!re_flags.glob)
+		if (!re_flags->glob)
 			break;
 
 		/*
@@ -1034,34 +1107,67 @@ setup_regexp_matches(text *orig_str, text *pattern, text *flags,
 			break;
 	}
 
+	/*
+	 * check length of unmatched portion between end of last match and end of
+	 * input string
+	 */
+	if (fetching_unmatched &&
+		(wide_len - prev_valid_match_end) > maxlen)
+		maxlen = (wide_len - prev_valid_match_end);
+
+	/*
+	 * Keep a note of the end position of the string for the benefit of
+	 * splitting code.
+	 */
+	matchctx->match_locs[array_idx] = wide_len;
+
+	if (eml > 1)
+	{
+		int64		maxsiz = eml * (int64) maxlen;
+		int			conv_bufsiz;
+
+		/*
+		 * Make the conversion buffer large enough for any substring of
+		 * interest.
+		 *
+		 * Worst case: assume we need the maximum size (maxlen*eml), but take
+		 * advantage of the fact that the original string length in bytes is an
+		 * upper bound on the byte length of any fetched substring (and we know
+		 * that len+1 is safe to allocate because the varlena header is longer
+		 * than 1 byte).
+		 */
+		if (maxsiz > orig_len)
+			conv_bufsiz = orig_len + 1;
+		else
+			conv_bufsiz = maxsiz + 1;	/* safe since maxsiz < 2^30 */
+
+		matchctx->conv_buf = palloc(conv_bufsiz);
+		matchctx->conv_bufsiz = conv_bufsiz;
+		matchctx->wide_str = wide_str;
+	}
+	else
+	{
+		/* No need to keep the wide string if we're in a single-byte charset. */
+		pfree(wide_str);
+		matchctx->wide_str = NULL;
+		matchctx->conv_buf = NULL;
+		matchctx->conv_bufsiz = 0;
+	}
+
 	/* Clean up temp storage */
-	pfree(wide_str);
 	pfree(pmatch);
 
 	return matchctx;
 }
 
 /*
- * cleanup_regexp_matches - release memory of a regexp_matches_ctx
- */
-static void
-cleanup_regexp_matches(regexp_matches_ctx *matchctx)
-{
-	pfree(matchctx->orig_str);
-	pfree(matchctx->match_locs);
-	if (matchctx->elems)
-		pfree(matchctx->elems);
-	if (matchctx->nulls)
-		pfree(matchctx->nulls);
-	pfree(matchctx);
-}
-
-/*
- * build_regexp_matches_result - build output array for current match
+ * build_regexp_match_result - build output array for current match
  */
 static ArrayType *
-build_regexp_matches_result(regexp_matches_ctx *matchctx)
+build_regexp_match_result(regexp_matches_ctx *matchctx)
 {
+	char	   *buf = matchctx->conv_buf;
+	int			bufsiz PG_USED_FOR_ASSERTS_ONLY = matchctx->conv_bufsiz;
 	Datum	   *elems = matchctx->elems;
 	bool	   *nulls = matchctx->nulls;
 	int			dims[1];
@@ -1081,10 +1187,19 @@ build_regexp_matches_result(regexp_matches_ctx *matchctx)
 			elems[i] = (Datum) 0;
 			nulls[i] = true;
 		}
+		else if (buf)
+		{
+			int		len = pg_wchar2mb_with_len(matchctx->wide_str + so,
+											   buf,
+											   eo - so);
+			Assert(len < bufsiz);
+			elems[i] = PointerGetDatum(cstring_to_text_with_len(buf, len));
+			nulls[i] = false;
+		}
 		else
 		{
 			elems[i] = DirectFunctionCall3(text_substr,
-										 PointerGetDatum(matchctx->orig_str),
+										   PointerGetDatum(matchctx->orig_str),
 										   Int32GetDatum(so + 1),
 										   Int32GetDatum(eo - so));
 			nulls[i] = false;
@@ -1114,16 +1229,27 @@ regexp_split_to_table(PG_FUNCTION_ARGS)
 	{
 		text	   *pattern = PG_GETARG_TEXT_PP(1);
 		text	   *flags = PG_GETARG_TEXT_PP_IF_EXISTS(2);
+		pg_re_flags re_flags;
 		MemoryContext oldcontext;
 
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
+		/* Determine options */
+		parse_re_flags(&re_flags, flags);
+		/* User mustn't specify 'g' */
+		if (re_flags.glob)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("regexp_split_to_table does not support the global option")));
+		/* But we find all the matches anyway */
+		re_flags.glob = true;
+
 		/* be sure to copy the input string into the multi-call ctx */
 		splitctx = setup_regexp_matches(PG_GETARG_TEXT_P_COPY(0), pattern,
-										flags,
+										&re_flags,
 										PG_GET_COLLATION(),
-										true, false, true);
+										false, true, true);
 
 		MemoryContextSwitchTo(oldcontext);
 		funcctx->user_fctx = (void *) splitctx;
@@ -1139,9 +1265,6 @@ regexp_split_to_table(PG_FUNCTION_ARGS)
 		splitctx->next_match++;
 		SRF_RETURN_NEXT(funcctx, result);
 	}
-
-	/* release space in multi-call ctx to avoid intraquery memory leak */
-	cleanup_regexp_matches(splitctx);
 
 	SRF_RETURN_DONE(funcctx);
 }
@@ -1162,13 +1285,24 @@ Datum
 regexp_split_to_array(PG_FUNCTION_ARGS)
 {
 	ArrayBuildState *astate = NULL;
+	pg_re_flags re_flags;
 	regexp_matches_ctx *splitctx;
+
+	/* Determine options */
+	parse_re_flags(&re_flags, PG_GETARG_TEXT_PP_IF_EXISTS(2));
+	/* User mustn't specify 'g' */
+	if (re_flags.glob)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("regexp_split_to_array does not support the global option")));
+	/* But we find all the matches anyway */
+	re_flags.glob = true;
 
 	splitctx = setup_regexp_matches(PG_GETARG_TEXT_PP(0),
 									PG_GETARG_TEXT_PP(1),
-									PG_GETARG_TEXT_PP_IF_EXISTS(2),
+									&re_flags,
 									PG_GET_COLLATION(),
-									true, false, true);
+									false, true, true);
 
 	while (splitctx->next_match <= splitctx->nmatches)
 	{
@@ -1179,12 +1313,6 @@ regexp_split_to_array(PG_FUNCTION_ARGS)
 								  CurrentMemoryContext);
 		splitctx->next_match++;
 	}
-
-	/*
-	 * We don't call cleanup_regexp_matches here; it would try to pfree the
-	 * input string, which we didn't copy.  The space is not in a long-lived
-	 * memory context anyway.
-	 */
 
 	PG_RETURN_ARRAYTYPE_P(makeArrayResult(astate, CurrentMemoryContext));
 }
@@ -1205,6 +1333,7 @@ regexp_split_to_array_no_flags(PG_FUNCTION_ARGS)
 static Datum
 build_regexp_split_result(regexp_matches_ctx *splitctx)
 {
+	char	   *buf = splitctx->conv_buf;
 	int			startpos;
 	int			endpos;
 
@@ -1215,7 +1344,21 @@ build_regexp_split_result(regexp_matches_ctx *splitctx)
 	if (startpos < 0)
 		elog(ERROR, "invalid match ending position");
 
-	if (splitctx->next_match < splitctx->nmatches)
+	if (buf)
+	{
+		int		bufsiz PG_USED_FOR_ASSERTS_ONLY = splitctx->conv_bufsiz;
+		int		len;
+
+		endpos = splitctx->match_locs[splitctx->next_match * 2];
+		if (endpos < startpos)
+			elog(ERROR, "invalid match starting position");
+		len = pg_wchar2mb_with_len(splitctx->wide_str + startpos,
+								   buf,
+								   endpos-startpos);
+		Assert(len < bufsiz);
+		return PointerGetDatum(cstring_to_text_with_len(buf, len));
+	}
+	else
 	{
 		endpos = splitctx->match_locs[splitctx->next_match * 2];
 		if (endpos < startpos)
@@ -1225,20 +1368,13 @@ build_regexp_split_result(regexp_matches_ctx *splitctx)
 								   Int32GetDatum(startpos + 1),
 								   Int32GetDatum(endpos - startpos));
 	}
-	else
-	{
-		/* no more matches, return rest of string */
-		return DirectFunctionCall2(text_substr_no_len,
-								   PointerGetDatum(splitctx->orig_str),
-								   Int32GetDatum(startpos + 1));
-	}
 }
 
 /*
  * regexp_fixed_prefix - extract fixed prefix, if any, for a regexp
  *
  * The result is NULL if there is no fixed prefix, else a palloc'd string.
- * If it is an exact match, not just a prefix, *exact is returned as TRUE.
+ * If it is an exact match, not just a prefix, *exact is returned as true.
  */
 char *
 regexp_fixed_prefix(text *text_re, bool case_insensitive, Oid collation,

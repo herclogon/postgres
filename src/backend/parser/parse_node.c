@@ -3,7 +3,7 @@
  * parse_node.c
  *	  various routines that make nodes for querytrees
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -51,6 +51,7 @@ make_parsestate(ParseState *parentParseState)
 
 	/* Fill in fields that don't start at null/false/zero */
 	pstate->p_next_resno = 1;
+	pstate->p_resolve_unknowns = true;
 
 	if (parentParseState)
 	{
@@ -61,6 +62,8 @@ make_parsestate(ParseState *parentParseState)
 		pstate->p_paramref_hook = parentParseState->p_paramref_hook;
 		pstate->p_coerce_param_hook = parentParseState->p_coerce_param_hook;
 		pstate->p_ref_hook_state = parentParseState->p_ref_hook_state;
+		/* query environment stays in context for the whole parse analysis */
+		pstate->p_queryEnv = parentParseState->p_queryEnv;
 	}
 
 	return pstate;
@@ -311,18 +314,18 @@ transformArraySubscripts(ParseState *pstate,
 		elementType = transformArrayType(&arrayType, &arrayTypMod);
 
 	/*
-	 * A list containing only single subscripts refers to a single array
-	 * element.  If any of the items are double subscripts (lower:upper), then
-	 * the subscript expression means an array slice operation. In this case,
-	 * we supply a default lower bound of 1 for any items that contain only a
-	 * single subscript.  We have to prescan the indirection list to see if
-	 * there are any double subscripts.
+	 * A list containing only simple subscripts refers to a single array
+	 * element.  If any of the items are slice specifiers (lower:upper), then
+	 * the subscript expression means an array slice operation.  In this case,
+	 * we convert any non-slice items to slices by treating the single
+	 * subscript as the upper bound and supplying an assumed lower bound of 1.
+	 * We have to prescan the list to see if there are any slice items.
 	 */
 	foreach(idx, indirection)
 	{
 		A_Indices  *ai = (A_Indices *) lfirst(idx);
 
-		if (ai->lidx != NULL)
+		if (ai->is_slice)
 		{
 			isSlice = true;
 			break;
@@ -334,10 +337,9 @@ transformArraySubscripts(ParseState *pstate,
 	 */
 	foreach(idx, indirection)
 	{
-		A_Indices  *ai = (A_Indices *) lfirst(idx);
+		A_Indices  *ai = lfirst_node(A_Indices, idx);
 		Node	   *subexpr;
 
-		Assert(IsA(ai, A_Indices));
 		if (isSlice)
 		{
 			if (ai->lidx)
@@ -354,9 +356,9 @@ transformArraySubscripts(ParseState *pstate,
 					ereport(ERROR,
 							(errcode(ERRCODE_DATATYPE_MISMATCH),
 							 errmsg("array subscript must have type integer"),
-						parser_errposition(pstate, exprLocation(ai->lidx))));
+							 parser_errposition(pstate, exprLocation(ai->lidx))));
 			}
-			else
+			else if (!ai->is_slice)
 			{
 				/* Make a constant 1 */
 				subexpr = (Node *) makeConst(INT4OID,
@@ -365,23 +367,40 @@ transformArraySubscripts(ParseState *pstate,
 											 sizeof(int32),
 											 Int32GetDatum(1),
 											 false,
-											 true);		/* pass by value */
+											 true); /* pass by value */
+			}
+			else
+			{
+				/* Slice with omitted lower bound, put NULL into the list */
+				subexpr = NULL;
 			}
 			lowerIndexpr = lappend(lowerIndexpr, subexpr);
 		}
-		subexpr = transformExpr(pstate, ai->uidx, pstate->p_expr_kind);
-		/* If it's not int4 already, try to coerce */
-		subexpr = coerce_to_target_type(pstate,
-										subexpr, exprType(subexpr),
-										INT4OID, -1,
-										COERCION_ASSIGNMENT,
-										COERCE_IMPLICIT_CAST,
-										-1);
-		if (subexpr == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("array subscript must have type integer"),
-					 parser_errposition(pstate, exprLocation(ai->uidx))));
+		else
+			Assert(ai->lidx == NULL && !ai->is_slice);
+
+		if (ai->uidx)
+		{
+			subexpr = transformExpr(pstate, ai->uidx, pstate->p_expr_kind);
+			/* If it's not int4 already, try to coerce */
+			subexpr = coerce_to_target_type(pstate,
+											subexpr, exprType(subexpr),
+											INT4OID, -1,
+											COERCION_ASSIGNMENT,
+											COERCE_IMPLICIT_CAST,
+											-1);
+			if (subexpr == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("array subscript must have type integer"),
+						 parser_errposition(pstate, exprLocation(ai->uidx))));
+		}
+		else
+		{
+			/* Slice with omitted upper bound, put NULL into the list */
+			Assert(isSlice && ai->is_slice);
+			subexpr = NULL;
+		}
 		upperIndexpr = lappend(upperIndexpr, subexpr);
 	}
 
@@ -408,7 +427,7 @@ transformArraySubscripts(ParseState *pstate,
 							" but expression is of type %s",
 							format_type_be(typeneeded),
 							format_type_be(typesource)),
-				 errhint("You will need to rewrite or cast the expression."),
+					 errhint("You will need to rewrite or cast the expression."),
 					 parser_errposition(pstate, exprLocation(assignFrom))));
 		assignFrom = newFrom;
 	}
@@ -492,7 +511,7 @@ make_const(ParseState *pstate, Value *value, int location)
 
 					typeid = INT8OID;
 					typelen = sizeof(int64);
-					typebyval = FLOAT8PASSBYVAL;		/* int8 and float8 alike */
+					typebyval = FLOAT8PASSBYVAL;	/* int8 and float8 alike */
 				}
 			}
 			else

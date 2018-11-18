@@ -2,7 +2,7 @@
 #
 # Makefile for src/test/ssl
 #
-# Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/test/ssl/Makefile
@@ -13,6 +13,8 @@ subdir = src/test/ssl
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
+export with_openssl
+
 CERTIFICATES := server_ca server-cn-and-alt-names \
 	server-cn-only server-single-alt-name server-multiple-alt-names \
 	server-no-names server-revoked server-ss \
@@ -20,15 +22,17 @@ CERTIFICATES := server_ca server-cn-and-alt-names \
 	root_ca
 
 SSLFILES := $(CERTIFICATES:%=ssl/%.key) $(CERTIFICATES:%=ssl/%.crt) \
+	ssl/server-password.key \
 	ssl/client.crl ssl/server.crl ssl/root.crl \
 	ssl/both-cas-1.crt ssl/both-cas-2.crt \
 	ssl/root+server_ca.crt ssl/root+server.crl \
-	ssl/root+client_ca.crt ssl/root+client.crl
+	ssl/root+client_ca.crt ssl/root+client.crl \
+	ssl/client+client_ca.crt
 
 # This target generates all the key and certificate files.
 sslfiles: $(SSLFILES)
 
-# Openssl requires a directory to put all generated certificates in. We don't
+# OpenSSL requires a directory to put all generated certificates in. We don't
 # use this for anything, but we need a location.
 ssl/new_certs_dir:
 	mkdir ssl/new_certs_dir
@@ -41,15 +45,16 @@ ssl/%.key:
 # Root CA certificate
 ssl/root_ca.crt: ssl/root_ca.key cas.config
 	touch ssl/root_ca-certindex
-	openssl req -new -out ssl/root_ca.crt -x509 -config cas.config -config root_ca.config -key ssl/root_ca.key -days 10000
+	openssl req -new -out ssl/root_ca.crt -x509 -config cas.config -config root_ca.config -key ssl/root_ca.key -days 10000 -extensions v3_ca
 	echo "01" > ssl/root_ca.srl
 
 # Client and server CAs
 ssl/%_ca.crt: ssl/%_ca.key %_ca.config ssl/root_ca.crt ssl/new_certs_dir
 	touch ssl/$*_ca-certindex
+	echo "unique_subject=no" > ssl/$*_ca-certindex.attr
 	openssl req -new -out ssl/temp_ca.crt -config cas.config -config $*_ca.config -key ssl/$*_ca.key
 # Sign the certificate with the root CA
-	openssl ca -name root_ca -batch -config cas.config -in ssl/temp_ca.crt -out ssl/temp_ca_signed.crt
+	openssl ca -name root_ca -batch -config cas.config -in ssl/temp_ca.crt -out ssl/temp_ca_signed.crt -extensions v3_ca
 	openssl x509 -in ssl/temp_ca_signed.crt -out ssl/$*_ca.crt # to keep just the PEM cert
 	rm ssl/temp_ca.crt ssl/temp_ca_signed.crt
 	echo "01" > ssl/$*_ca.srl
@@ -66,6 +71,10 @@ ssl/server-ss.crt: ssl/server-cn-only.key ssl/server-cn-only.crt server-cn-only.
 	openssl req -new -key ssl/server-cn-only.key -out ssl/server-ss.csr -config server-cn-only.config
 	openssl x509 -req -days 10000 -in ssl/server-ss.csr -signkey ssl/server-cn-only.key -out ssl/server-ss.crt  -extensions v3_req -extfile server-cn-only.config
 	rm ssl/server-ss.csr
+
+# Password-protected version of server-cn-only.key
+ssl/server-password.key: ssl/server-cn-only.key
+	openssl rsa -des -in $< -out $@ -passout 'pass:secret1'
 
 # Client certificate, signed by the client CA:
 ssl/client.crt: ssl/client.key ssl/client_ca.crt
@@ -98,6 +107,9 @@ ssl/root+server_ca.crt: ssl/root_ca.crt ssl/server_ca.crt
 ssl/root+client_ca.crt: ssl/root_ca.crt ssl/client_ca.crt
 	cat $^ > $@
 
+ssl/client+client_ca.crt: ssl/client.crt ssl/client_ca.crt
+	cat $^ > $@
+
 #### CRLs
 
 ssl/client.crl: ssl/client-revoked.crt
@@ -122,5 +134,11 @@ ssl/root+client.crl: ssl/root.crl ssl/client.crl
 sslfiles-clean:
 	rm -f $(SSLFILES) ssl/client_ca.srl ssl/server_ca.srl ssl/client_ca-certindex* ssl/server_ca-certindex* ssl/root_ca-certindex* ssl/root_ca.srl ssl/temp_ca.crt ssl/temp_ca_signed.crt
 
+clean distclean maintainer-clean:
+	rm -rf tmp_check
+
 check:
 	$(prove_check)
+
+installcheck:
+	$(prove_installcheck)

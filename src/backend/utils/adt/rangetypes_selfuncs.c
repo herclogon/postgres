@@ -6,7 +6,7 @@
  * Estimates are based on histograms of lower and upper bounds, and the
  * fraction of empty ranges.
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,10 +17,14 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/htup_details.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_statistic.h"
-#include "utils/builtins.h"
+#include "catalog/pg_type.h"
+#include "utils/float.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/rangetypes.h"
 #include "utils/selfuncs.h"
@@ -46,15 +50,15 @@ static float8 get_distance(TypeCacheEntry *typcache, RangeBound *bound1,
 static int length_hist_bsearch(Datum *length_hist_values,
 					int length_hist_nvalues, double value, bool equal);
 static double calc_length_hist_frac(Datum *length_hist_values,
-		int length_hist_nvalues, double length1, double length2, bool equal);
+					  int length_hist_nvalues, double length1, double length2, bool equal);
 static double calc_hist_selectivity_contained(TypeCacheEntry *typcache,
 								RangeBound *lower, RangeBound *upper,
 								RangeBound *hist_lower, int hist_nvalues,
-						 Datum *length_hist_values, int length_hist_nvalues);
+								Datum *length_hist_values, int length_hist_nvalues);
 static double calc_hist_selectivity_contains(TypeCacheEntry *typcache,
 							   RangeBound *lower, RangeBound *upper,
 							   RangeBound *hist_lower, int hist_nvalues,
-						 Datum *length_hist_values, int length_hist_nvalues);
+							   Datum *length_hist_values, int length_hist_nvalues);
 
 /*
  * Returns a default selectivity estimate for given operator, when we don't
@@ -202,7 +206,7 @@ rangesel(PG_FUNCTION_ARGS)
 		/* Both sides are the same range type */
 		typcache = range_get_typcache(fcinfo, vardata.vartype);
 
-		constrange = DatumGetRangeType(((Const *) other)->constvalue);
+		constrange = DatumGetRangeTypeP(((Const *) other)->constvalue);
 	}
 
 	/*
@@ -238,23 +242,21 @@ calc_rangesel(TypeCacheEntry *typcache, VariableStatData *vardata,
 	if (HeapTupleIsValid(vardata->statsTuple))
 	{
 		Form_pg_statistic stats;
-		float4	   *numbers;
-		int			nnumbers;
+		AttStatsSlot sslot;
 
 		stats = (Form_pg_statistic) GETSTRUCT(vardata->statsTuple);
 		null_frac = stats->stanullfrac;
 
 		/* Try to get fraction of empty ranges */
-		if (get_attstatsslot(vardata->statsTuple,
-							 vardata->atttype, vardata->atttypmod,
-						   STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM, InvalidOid,
-							 NULL,
-							 NULL, NULL,
-							 &numbers, &nnumbers))
+		if (get_attstatsslot(&sslot, vardata->statsTuple,
+							 STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM,
+							 InvalidOid,
+							 ATTSTATSSLOT_NUMBERS))
 		{
-			if (nnumbers != 1)
-				elog(ERROR, "invalid empty fraction statistic");		/* shouldn't happen */
-			empty_frac = numbers[0];
+			if (sslot.nnumbers != 1)
+				elog(ERROR, "invalid empty fraction statistic");	/* shouldn't happen */
+			empty_frac = sslot.numbers[0];
+			free_attstatsslot(&sslot);
 		}
 		else
 		{
@@ -371,10 +373,9 @@ static double
 calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 					  RangeType *constval, Oid operator)
 {
-	Datum	   *hist_values;
+	AttStatsSlot hslot;
+	AttStatsSlot lslot;
 	int			nhist;
-	Datum	   *length_hist_values;
-	int			length_nhist;
 	RangeBound *hist_lower;
 	RangeBound *hist_upper;
 	int			i;
@@ -383,25 +384,32 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 	bool		empty;
 	double		hist_selec;
 
+	/* Can't use the histogram with insecure range support functions */
+	if (!statistic_proc_security_check(vardata,
+									   typcache->rng_cmp_proc_finfo.fn_oid))
+		return -1;
+	if (OidIsValid(typcache->rng_subdiff_finfo.fn_oid) &&
+		!statistic_proc_security_check(vardata,
+									   typcache->rng_subdiff_finfo.fn_oid))
+		return -1;
+
 	/* Try to get histogram of ranges */
 	if (!(HeapTupleIsValid(vardata->statsTuple) &&
-		  get_attstatsslot(vardata->statsTuple,
-						   vardata->atttype, vardata->atttypmod,
+		  get_attstatsslot(&hslot, vardata->statsTuple,
 						   STATISTIC_KIND_BOUNDS_HISTOGRAM, InvalidOid,
-						   NULL,
-						   &hist_values, &nhist,
-						   NULL, NULL)))
+						   ATTSTATSSLOT_VALUES)))
 		return -1.0;
 
 	/*
 	 * Convert histogram of ranges into histograms of its lower and upper
 	 * bounds.
 	 */
+	nhist = hslot.nvalues;
 	hist_lower = (RangeBound *) palloc(sizeof(RangeBound) * nhist);
 	hist_upper = (RangeBound *) palloc(sizeof(RangeBound) * nhist);
 	for (i = 0; i < nhist; i++)
 	{
-		range_deserialize(typcache, DatumGetRangeType(hist_values[i]),
+		range_deserialize(typcache, DatumGetRangeTypeP(hslot.values[i]),
 						  &hist_lower[i], &hist_upper[i], &empty);
 		/* The histogram should not contain any empty ranges */
 		if (empty)
@@ -413,19 +421,25 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 		operator == OID_RANGE_CONTAINED_OP)
 	{
 		if (!(HeapTupleIsValid(vardata->statsTuple) &&
-			  get_attstatsslot(vardata->statsTuple,
-							   vardata->atttype, vardata->atttypmod,
+			  get_attstatsslot(&lslot, vardata->statsTuple,
 							   STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM,
 							   InvalidOid,
-							   NULL,
-							   &length_hist_values, &length_nhist,
-							   NULL, NULL)))
+							   ATTSTATSSLOT_VALUES)))
+		{
+			free_attstatsslot(&hslot);
 			return -1.0;
+		}
 
 		/* check that it's a histogram, not just a dummy entry */
-		if (length_nhist < 2)
+		if (lslot.nvalues < 2)
+		{
+			free_attstatsslot(&lslot);
+			free_attstatsslot(&hslot);
 			return -1.0;
+		}
 	}
+	else
+		memset(&lslot, 0, sizeof(lslot));
 
 	/* Extract the bounds of the constant value. */
 	range_deserialize(typcache, constval, &const_lower, &const_upper, &empty);
@@ -524,8 +538,8 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 		case OID_RANGE_CONTAINS_OP:
 			hist_selec =
 				calc_hist_selectivity_contains(typcache, &const_lower,
-											 &const_upper, hist_lower, nhist,
-										   length_hist_values, length_nhist);
+											   &const_upper, hist_lower, nhist,
+											   lslot.values, lslot.nvalues);
 			break;
 
 		case OID_RANGE_CONTAINED_OP:
@@ -533,7 +547,7 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 			{
 				/*
 				 * Lower bound no longer matters. Just estimate the fraction
-				 * with an upper bound <= const uppert bound
+				 * with an upper bound <= const upper bound
 				 */
 				hist_selec =
 					calc_hist_selectivity_scalar(typcache, &const_upper,
@@ -543,14 +557,14 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 			{
 				hist_selec =
 					1.0 - calc_hist_selectivity_scalar(typcache, &const_lower,
-												   hist_lower, nhist, false);
+													   hist_lower, nhist, false);
 			}
 			else
 			{
 				hist_selec =
 					calc_hist_selectivity_contained(typcache, &const_lower,
-											 &const_upper, hist_lower, nhist,
-										   length_hist_values, length_nhist);
+													&const_upper, hist_lower, nhist,
+													lslot.values, lslot.nvalues);
 			}
 			break;
 
@@ -559,6 +573,9 @@ calc_hist_selectivity(TypeCacheEntry *typcache, VariableStatData *vardata,
 			hist_selec = -1.0;	/* keep compiler quiet */
 			break;
 	}
+
+	free_attstatsslot(&lslot);
+	free_attstatsslot(&hslot);
 
 	return hist_selec;
 }
@@ -585,7 +602,7 @@ calc_hist_selectivity_scalar(TypeCacheEntry *typcache, RangeBound *constbound,
 	/* Adjust using linear interpolation within the bin */
 	if (index >= 0 && index < hist_nvalues - 1)
 		selec += get_position(typcache, constbound, &hist[index],
-						&hist[index + 1]) / (Selectivity) (hist_nvalues - 1);
+							  &hist[index + 1]) / (Selectivity) (hist_nvalues - 1);
 
 	return selec;
 }
@@ -680,7 +697,7 @@ get_position(TypeCacheEntry *typcache, RangeBound *value, RangeBound *hist1,
 
 		/* Calculate relative position using subdiff function. */
 		bin_width = DatumGetFloat8(FunctionCall2Coll(
-												&typcache->rng_subdiff_finfo,
+													 &typcache->rng_subdiff_finfo,
 													 typcache->rng_collation,
 													 hist2->val,
 													 hist1->val));
@@ -688,7 +705,7 @@ get_position(TypeCacheEntry *typcache, RangeBound *value, RangeBound *hist1,
 			return 0.5;			/* zero width bin */
 
 		position = DatumGetFloat8(FunctionCall2Coll(
-												&typcache->rng_subdiff_finfo,
+													&typcache->rng_subdiff_finfo,
 													typcache->rng_collation,
 													value->val,
 													hist1->val))
@@ -735,19 +752,19 @@ get_position(TypeCacheEntry *typcache, RangeBound *value, RangeBound *hist1,
 static double
 get_len_position(double value, double hist1, double hist2)
 {
-	if (!is_infinite(hist1) && !is_infinite(hist2))
+	if (!isinf(hist1) && !isinf(hist2))
 	{
 		/*
 		 * Both bounds are finite. The value should be finite too, because it
 		 * lies somewhere between the bounds. If it doesn't, just return
 		 * something.
 		 */
-		if (is_infinite(value))
+		if (isinf(value))
 			return 0.5;
 
 		return 1.0 - (hist2 - value) / (hist2 - hist1);
 	}
-	else if (is_infinite(hist1) && !is_infinite(hist2))
+	else if (isinf(hist1) && !isinf(hist2))
 	{
 		/*
 		 * Lower bin boundary is -infinite, upper is finite. Return 1.0 to
@@ -755,7 +772,7 @@ get_len_position(double value, double hist1, double hist2)
 		 */
 		return 1.0;
 	}
-	else if (is_infinite(hist1) && is_infinite(hist2))
+	else if (isinf(hist1) && isinf(hist2))
 	{
 		/* same as above, but in reverse */
 		return 0.0;
@@ -836,7 +853,7 @@ calc_length_hist_frac(Datum *length_hist_values, int length_hist_nvalues,
 		return 0.0;				/* shouldn't happen, but doesn't hurt to check */
 
 	/* All lengths in the table are <= infinite. */
-	if (is_infinite(length2) && equal)
+	if (isinf(length2) && equal)
 		return 1.0;
 
 	/*----------
@@ -963,7 +980,7 @@ calc_length_hist_frac(Datum *length_hist_values, int length_hist_nvalues,
 	 * length2 is infinite. It's not clear what the correct value would be in
 	 * that case, so 0.5 seems as good as any value.
 	 */
-	if (is_infinite(area) && is_infinite(length2))
+	if (isinf(area) && isinf(length2))
 		frac = 0.5;
 	else
 		frac = area / (length2 - length1);
@@ -984,7 +1001,7 @@ static double
 calc_hist_selectivity_contained(TypeCacheEntry *typcache,
 								RangeBound *lower, RangeBound *upper,
 								RangeBound *hist_lower, int hist_nvalues,
-						  Datum *length_hist_values, int length_hist_nvalues)
+								Datum *length_hist_values, int length_hist_nvalues)
 {
 	int			i,
 				upper_index;
@@ -1094,7 +1111,7 @@ static double
 calc_hist_selectivity_contains(TypeCacheEntry *typcache,
 							   RangeBound *lower, RangeBound *upper,
 							   RangeBound *hist_lower, int hist_nvalues,
-						  Datum *length_hist_values, int length_hist_nvalues)
+							   Datum *length_hist_values, int length_hist_nvalues)
 {
 	int			i,
 				lower_index;

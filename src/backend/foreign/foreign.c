@@ -3,7 +3,7 @@
  * foreign.c
  *		  support for foreign-data wrappers, servers and user mappings.
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/backend/foreign/foreign.c
@@ -26,10 +26,6 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-
-
-extern Datum pg_options_to_table(PG_FUNCTION_ARGS);
-extern Datum postgresql_fdw_validator(PG_FUNCTION_ARGS);
 
 
 /*
@@ -120,14 +116,14 @@ GetForeignServer(Oid serverid)
 							tp,
 							Anum_pg_foreign_server_srvtype,
 							&isnull);
-	server->servertype = isnull ? NULL : pstrdup(TextDatumGetCString(datum));
+	server->servertype = isnull ? NULL : TextDatumGetCString(datum);
 
 	/* Extract server version */
 	datum = SysCacheGetAttr(FOREIGNSERVEROID,
 							tp,
 							Anum_pg_foreign_server_srvversion,
 							&isnull);
-	server->serverversion = isnull ? NULL : pstrdup(TextDatumGetCString(datum));
+	server->serverversion = isnull ? NULL : TextDatumGetCString(datum);
 
 	/* Extract the srvoptions */
 	datum = SysCacheGetAttr(FOREIGNSERVEROID,
@@ -193,6 +189,7 @@ GetUserMapping(Oid userid, Oid serverid)
 						MappingUserName(userid))));
 
 	um = (UserMapping *) palloc(sizeof(UserMapping));
+	um->umid = HeapTupleGetOid(tp);
 	um->userid = userid;
 	um->serverid = serverid;
 
@@ -431,7 +428,7 @@ GetFdwRoutineForRelation(Relation relation, bool makecopy)
 /*
  * IsImportableForeignTable - filter table names for IMPORT FOREIGN SCHEMA
  *
- * Returns TRUE if given table name should be imported according to the
+ * Returns true if given table name should be imported according to the
  * statement's import filter options.
  */
 bool
@@ -563,7 +560,7 @@ struct ConnectionOption
  *
  * The list is small - don't bother with bsearch if it stays so.
  */
-static struct ConnectionOption libpq_conninfo_options[] = {
+static const struct ConnectionOption libpq_conninfo_options[] = {
 	{"authtype", ForeignServerRelationId},
 	{"service", ForeignServerRelationId},
 	{"user", UserMappingRelationId},
@@ -590,7 +587,7 @@ static struct ConnectionOption libpq_conninfo_options[] = {
 static bool
 is_conninfo_option(const char *option, Oid context)
 {
-	struct ConnectionOption *opt;
+	const struct ConnectionOption *opt;
 
 	for (opt = libpq_conninfo_options; opt->optname; opt++)
 		if (context == opt->optcontext && strcmp(opt->optname, option) == 0)
@@ -625,7 +622,7 @@ postgresql_fdw_validator(PG_FUNCTION_ARGS)
 
 		if (!is_conninfo_option(def->defname, catalog))
 		{
-			struct ConnectionOption *opt;
+			const struct ConnectionOption *opt;
 			StringInfoData buf;
 
 			/*
@@ -690,4 +687,115 @@ get_foreign_server_oid(const char *servername, bool missing_ok)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("server \"%s\" does not exist", servername)));
 	return oid;
+}
+
+/*
+ * Get a copy of an existing local path for a given join relation.
+ *
+ * This function is usually helpful to obtain an alternate local path for EPQ
+ * checks.
+ *
+ * Right now, this function only supports unparameterized foreign joins, so we
+ * only search for unparameterized path in the given list of paths. Since we
+ * are searching for a path which can be used to construct an alternative local
+ * plan for a foreign join, we look for only MergeJoin, HashJoin or NestLoop
+ * paths.
+ *
+ * If the inner or outer subpath of the chosen path is a ForeignScan, we
+ * replace it with its outer subpath.  For this reason, and also because the
+ * planner might free the original path later, the path returned by this
+ * function is a shallow copy of the original.  There's no need to copy
+ * the substructure, so we don't.
+ *
+ * Since the plan created using this path will presumably only be used to
+ * execute EPQ checks, efficiency of the path is not a concern. But since the
+ * path list in RelOptInfo is anyway sorted by total cost we are likely to
+ * choose the most efficient path, which is all for the best.
+ */
+Path *
+GetExistingLocalJoinPath(RelOptInfo *joinrel)
+{
+	ListCell   *lc;
+
+	Assert(IS_JOIN_REL(joinrel));
+
+	foreach(lc, joinrel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+		JoinPath   *joinpath = NULL;
+
+		/* Skip parameterized paths. */
+		if (path->param_info != NULL)
+			continue;
+
+		switch (path->pathtype)
+		{
+			case T_HashJoin:
+				{
+					HashPath   *hash_path = makeNode(HashPath);
+
+					memcpy(hash_path, path, sizeof(HashPath));
+					joinpath = (JoinPath *) hash_path;
+				}
+				break;
+
+			case T_NestLoop:
+				{
+					NestPath   *nest_path = makeNode(NestPath);
+
+					memcpy(nest_path, path, sizeof(NestPath));
+					joinpath = (JoinPath *) nest_path;
+				}
+				break;
+
+			case T_MergeJoin:
+				{
+					MergePath  *merge_path = makeNode(MergePath);
+
+					memcpy(merge_path, path, sizeof(MergePath));
+					joinpath = (JoinPath *) merge_path;
+				}
+				break;
+
+			default:
+
+				/*
+				 * Just skip anything else. We don't know if corresponding
+				 * plan would build the output row from whole-row references
+				 * of base relations and execute the EPQ checks.
+				 */
+				break;
+		}
+
+		/* This path isn't good for us, check next. */
+		if (!joinpath)
+			continue;
+
+		/*
+		 * If either inner or outer path is a ForeignPath corresponding to a
+		 * pushed down join, replace it with the fdw_outerpath, so that we
+		 * maintain path for EPQ checks built entirely of local join
+		 * strategies.
+		 */
+		if (IsA(joinpath->outerjoinpath, ForeignPath))
+		{
+			ForeignPath *foreign_path;
+
+			foreign_path = (ForeignPath *) joinpath->outerjoinpath;
+			if (IS_JOIN_REL(foreign_path->path.parent))
+				joinpath->outerjoinpath = foreign_path->fdw_outerpath;
+		}
+
+		if (IsA(joinpath->innerjoinpath, ForeignPath))
+		{
+			ForeignPath *foreign_path;
+
+			foreign_path = (ForeignPath *) joinpath->innerjoinpath;
+			if (IS_JOIN_REL(foreign_path->path.parent))
+				joinpath->innerjoinpath = foreign_path->fdw_outerpath;
+		}
+
+		return (Path *) joinpath;
+	}
+	return NULL;
 }

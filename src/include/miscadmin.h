@@ -10,7 +10,7 @@
  *	  Over time, this has also become the preferred place for widely known
  *	  resource-limitation stuff, such as work_mem and check_stack_depth().
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/miscadmin.h
@@ -23,10 +23,11 @@
 #ifndef MISCADMIN_H
 #define MISCADMIN_H
 
+#include <signal.h>
+
+#include "datatype/timestamp.h"	/* for TimestampTZ */
 #include "pgtime.h"				/* for pg_time_t */
 
-
-#define PG_BACKEND_VERSIONSTR "postgres (PostgreSQL) " PG_VERSION "\n"
 
 #define InvalidPid				(-1)
 
@@ -77,11 +78,13 @@
 
 /* in globals.c */
 /* these are marked volatile because they are set by signal handlers: */
-extern PGDLLIMPORT volatile bool InterruptPending;
-extern PGDLLIMPORT volatile bool QueryCancelPending;
-extern PGDLLIMPORT volatile bool ProcDiePending;
+extern PGDLLIMPORT volatile sig_atomic_t InterruptPending;
+extern PGDLLIMPORT volatile sig_atomic_t QueryCancelPending;
+extern PGDLLIMPORT volatile sig_atomic_t ProcDiePending;
+extern PGDLLIMPORT volatile sig_atomic_t IdleInTransactionSessionTimeoutPending;
+extern PGDLLIMPORT volatile sig_atomic_t ConfigReloadPending;
 
-extern volatile bool ClientConnectionLost;
+extern PGDLLIMPORT volatile sig_atomic_t ClientConnectionLost;
 
 /* these are marked volatile because they are examined by signal handlers: */
 extern PGDLLIMPORT volatile uint32 InterruptHoldoffCount;
@@ -107,7 +110,7 @@ do { \
 	if (InterruptPending) \
 		ProcessInterrupts(); \
 } while(0)
-#endif   /* WIN32 */
+#endif							/* WIN32 */
 
 
 #define HOLD_INTERRUPTS()  (InterruptHoldoffCount++)
@@ -142,26 +145,29 @@ do { \
 /*
  * from utils/init/globals.c
  */
-extern pid_t PostmasterPid;
-extern bool IsPostmasterEnvironment;
+extern PGDLLIMPORT pid_t PostmasterPid;
+extern PGDLLIMPORT bool IsPostmasterEnvironment;
 extern PGDLLIMPORT bool IsUnderPostmaster;
-extern bool IsBackgroundWorker;
+extern PGDLLIMPORT bool IsBackgroundWorker;
 extern PGDLLIMPORT bool IsBinaryUpgrade;
 
-extern bool ExitOnAnyError;
+extern PGDLLIMPORT bool ExitOnAnyError;
 
 extern PGDLLIMPORT char *DataDir;
+extern PGDLLIMPORT int data_directory_mode;
 
 extern PGDLLIMPORT int NBuffers;
-extern int	MaxBackends;
-extern int	MaxConnections;
-extern int	max_worker_processes;
+extern PGDLLIMPORT int MaxBackends;
+extern PGDLLIMPORT int MaxConnections;
+extern PGDLLIMPORT int max_worker_processes;
+extern PGDLLIMPORT int max_parallel_workers;
 
 extern PGDLLIMPORT int MyProcPid;
 extern PGDLLIMPORT pg_time_t MyStartTime;
+extern PGDLLIMPORT TimestampTz MyStartTimestamp;
 extern PGDLLIMPORT struct Port *MyProcPort;
 extern PGDLLIMPORT struct Latch *MyLatch;
-extern long MyCancelKey;
+extern int32 MyCancelKey;
 extern int	MyPMChildSlot;
 
 extern char OutputFileName[];
@@ -235,9 +241,10 @@ extern PGDLLIMPORT int IntervalStyle;
 #define MAXTZLEN		10		/* max TZ name len, not counting tr. null */
 
 extern bool enableFsync;
-extern bool allowSystemTableMods;
+extern PGDLLIMPORT bool allowSystemTableMods;
 extern PGDLLIMPORT int work_mem;
 extern PGDLLIMPORT int maintenance_work_mem;
+extern PGDLLIMPORT int max_parallel_maintenance_workers;
 
 extern int	VacuumCostPageHit;
 extern int	VacuumCostPageMiss;
@@ -251,6 +258,8 @@ extern int	VacuumPageDirty;
 
 extern int	VacuumCostBalance;
 extern bool VacuumCostActive;
+
+extern double vacuum_cleanup_index_scale_factor;
 
 
 /* in tcop/postgres.c */
@@ -269,6 +278,8 @@ extern pg_stack_base_t set_stack_base(void);
 extern void restore_stack_base(pg_stack_base_t base);
 extern void check_stack_depth(void);
 extern bool stack_is_too_deep(void);
+
+extern void PostgresSigHupHandler(SIGNAL_ARGS);
 
 /* in tcop/utility.c */
 extern void PreventCommandIfReadOnly(const char *cmdname);
@@ -315,6 +326,7 @@ extern void SetSessionAuthorization(Oid userid, bool is_superuser);
 extern Oid	GetCurrentRoleId(void);
 extern void SetCurrentRoleId(Oid roleid, bool is_superuser);
 
+extern void checkDataDir(void);
 extern void SetDataDir(const char *dir);
 extern void ChangeToDataDir(void);
 
@@ -413,7 +425,7 @@ extern AuxProcType MyAuxProcType;
 extern void pg_split_opts(char **argv, int *argcp, const char *optstr);
 extern void InitializeMaxBackends(void);
 extern void InitPostgres(const char *in_dbname, Oid dboid, const char *username,
-			 Oid useroid, char *out_dbname);
+			 Oid useroid, char *out_dbname, bool override_allow_connections);
 extern void BaseInit(void);
 
 /* in utils/init/miscinit.c */
@@ -422,31 +434,6 @@ extern PGDLLIMPORT bool process_shared_preload_libraries_in_progress;
 extern char *session_preload_libraries_string;
 extern char *shared_preload_libraries_string;
 extern char *local_preload_libraries_string;
-
-/*
- * As of 9.1, the contents of the data-directory lock file are:
- *
- * line #
- *		1	postmaster PID (or negative of a standalone backend's PID)
- *		2	data directory path
- *		3	postmaster start timestamp (time_t representation)
- *		4	port number
- *		5	first Unix socket directory path (empty if none)
- *		6	first listen_address (IP address or "*"; empty if no TCP port)
- *		7	shared memory key (not present on Windows)
- *
- * Lines 6 and up are added via AddToDataDirLockFile() after initial file
- * creation.
- *
- * The socket lock file, if used, has the same contents as lines 1-5.
- */
-#define LOCK_FILE_LINE_PID			1
-#define LOCK_FILE_LINE_DATA_DIR		2
-#define LOCK_FILE_LINE_START_TIME	3
-#define LOCK_FILE_LINE_PORT			4
-#define LOCK_FILE_LINE_SOCKET_DIR	5
-#define LOCK_FILE_LINE_LISTEN_ADDR	6
-#define LOCK_FILE_LINE_SHMEM_KEY	7
 
 extern void CreateDataDirLockFile(bool amPostmaster);
 extern void CreateSocketLockFile(const char *socketfile, bool amPostmaster,
@@ -464,4 +451,4 @@ extern bool has_rolreplication(Oid roleid);
 extern bool BackupInProgress(void);
 extern void CancelBackup(void);
 
-#endif   /* MISCADMIN_H */
+#endif							/* MISCADMIN_H */

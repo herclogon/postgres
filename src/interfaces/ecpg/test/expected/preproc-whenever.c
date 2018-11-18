@@ -24,7 +24,7 @@
 #line 5 "whenever.pgc"
 
 
-static void print(char *msg)
+static void print(const char *msg)
 {
         fprintf(stderr, "Error in statement '%s':\n", msg);
         sqlprint();
@@ -58,7 +58,7 @@ int main(void)
 
 	ECPGdebug(1, stderr);
 
-	{ ECPGconnect(__LINE__, 0, "regress1" , NULL, NULL , NULL, 0); 
+	{ ECPGconnect(__LINE__, 0, "ecpg1_regression" , NULL, NULL , NULL, 0); 
 #line 31 "whenever.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}

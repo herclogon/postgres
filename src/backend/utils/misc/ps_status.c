@@ -7,7 +7,7 @@
  *
  * src/backend/utils/misc/ps_status.c
  *
- * Copyright (c) 2000-2015, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2018, PostgreSQL Global Development Group
  * various details abducted from various places
  *--------------------------------------------------------------------
  */
@@ -38,6 +38,9 @@ bool		update_process_title = true;
 /*
  * Alternative ways of updating ps display:
  *
+ * PS_USE_SETPROCTITLE_FAST
+ *	   use the function setproctitle_fast(const char *, ...)
+ *	   (newer FreeBSD systems)
  * PS_USE_SETPROCTITLE
  *	   use the function setproctitle(const char *, ...)
  *	   (newer BSD systems)
@@ -59,7 +62,9 @@ bool		update_process_title = true;
  *	   don't update ps display
  *	   (This is the default, as it is safest.)
  */
-#if defined(HAVE_SETPROCTITLE)
+#if defined(HAVE_SETPROCTITLE_FAST)
+#define PS_USE_SETPROCTITLE_FAST
+#elif defined(HAVE_SETPROCTITLE)
 #define PS_USE_SETPROCTITLE
 #elif defined(HAVE_PSTAT) && defined(PSTAT_SETCMD)
 #define PS_USE_PSTAT
@@ -93,11 +98,11 @@ static const size_t ps_buffer_size = PS_BUFFER_SIZE;
 static char *ps_buffer;			/* will point to argv area */
 static size_t ps_buffer_size;	/* space determined at run time */
 static size_t last_status_len;	/* use to minimize length of clobber */
-#endif   /* PS_USE_CLOBBER_ARGV */
+#endif							/* PS_USE_CLOBBER_ARGV */
 
 static size_t ps_buffer_cur_len;	/* nominal strlen(ps_buffer) */
 
-static size_t ps_buffer_fixed_size;		/* size of the constant prefix */
+static size_t ps_buffer_fixed_size; /* size of the constant prefix */
 
 /* save the original argv[] location here */
 static int	save_argc;
@@ -113,6 +118,9 @@ static char **save_argv;
  * overwritten during init_ps_display.  Also, the physical location of the
  * environment strings may be moved, so this should be called before any code
  * that might try to hang onto a getenv() result.)
+ *
+ * Note that in case of failure this cannot call elog() as that is not
+ * initialized yet.  We rely on write_stderr() instead.
  */
 char	  **
 save_ps_display_args(int argc, char **argv)
@@ -163,12 +171,24 @@ save_ps_display_args(int argc, char **argv)
 		 * move the environment out of the way
 		 */
 		new_environ = (char **) malloc((i + 1) * sizeof(char *));
+		if (!new_environ)
+		{
+			write_stderr("out of memory\n");
+			exit(1);
+		}
 		for (i = 0; environ[i] != NULL; i++)
+		{
 			new_environ[i] = strdup(environ[i]);
+			if (!new_environ[i])
+			{
+				write_stderr("out of memory\n");
+				exit(1);
+			}
+		}
 		new_environ[i] = NULL;
 		environ = new_environ;
 	}
-#endif   /* PS_USE_CLOBBER_ARGV */
+#endif							/* PS_USE_CLOBBER_ARGV */
 
 #if defined(PS_USE_CHANGE_ARGV) || defined(PS_USE_CLOBBER_ARGV)
 
@@ -189,22 +209,34 @@ save_ps_display_args(int argc, char **argv)
 		int			i;
 
 		new_argv = (char **) malloc((argc + 1) * sizeof(char *));
+		if (!new_argv)
+		{
+			write_stderr("out of memory\n");
+			exit(1);
+		}
 		for (i = 0; i < argc; i++)
+		{
 			new_argv[i] = strdup(argv[i]);
+			if (!new_argv[i])
+			{
+				write_stderr("out of memory\n");
+				exit(1);
+			}
+		}
 		new_argv[argc] = NULL;
 
 #if defined(__darwin__)
 
 		/*
-		 * Darwin (and perhaps other NeXT-derived platforms?) has a static
-		 * copy of the argv pointer, which we may fix like so:
+		 * macOS (and perhaps other NeXT-derived platforms?) has a static copy
+		 * of the argv pointer, which we may fix like so:
 		 */
 		*_NSGetArgv() = new_argv;
 #endif
 
 		argv = new_argv;
 	}
-#endif   /* PS_USE_CHANGE_ARGV or PS_USE_CLOBBER_ARGV */
+#endif							/* PS_USE_CHANGE_ARGV or PS_USE_CLOBBER_ARGV */
 
 	return argv;
 }
@@ -243,7 +275,7 @@ init_ps_display(const char *username, const char *dbname,
 #ifdef PS_USE_CHANGE_ARGV
 	save_argv[0] = ps_buffer;
 	save_argv[1] = NULL;
-#endif   /* PS_USE_CHANGE_ARGV */
+#endif							/* PS_USE_CHANGE_ARGV */
 
 #ifdef PS_USE_CLOBBER_ARGV
 	{
@@ -253,13 +285,13 @@ init_ps_display(const char *username, const char *dbname,
 		for (i = 1; i < save_argc; i++)
 			save_argv[i] = ps_buffer + ps_buffer_size;
 	}
-#endif   /* PS_USE_CLOBBER_ARGV */
+#endif							/* PS_USE_CLOBBER_ARGV */
 
 	/*
 	 * Make fixed prefix of ps display.
 	 */
 
-#ifdef PS_USE_SETPROCTITLE
+#if defined(PS_USE_SETPROCTITLE) || defined(PS_USE_SETPROCTITLE_FAST)
 
 	/*
 	 * apparently setproctitle() already adds a `progname:' prefix to the ps
@@ -286,7 +318,7 @@ init_ps_display(const char *username, const char *dbname,
 	ps_buffer_cur_len = ps_buffer_fixed_size = strlen(ps_buffer);
 
 	set_ps_display(initial_str, true);
-#endif   /* not PS_USE_NONE */
+#endif							/* not PS_USE_NONE */
 }
 
 
@@ -322,6 +354,8 @@ set_ps_display(const char *activity, bool force)
 
 #ifdef PS_USE_SETPROCTITLE
 	setproctitle("%s", ps_buffer);
+#elif defined(PS_USE_SETPROCTITLE_FAST)
+	setproctitle_fast("%s", ps_buffer);
 #endif
 
 #ifdef PS_USE_PSTAT
@@ -331,12 +365,12 @@ set_ps_display(const char *activity, bool force)
 		pst.pst_command = ps_buffer;
 		pstat(PSTAT_SETCMD, pst, ps_buffer_cur_len, 0, 0);
 	}
-#endif   /* PS_USE_PSTAT */
+#endif							/* PS_USE_PSTAT */
 
 #ifdef PS_USE_PS_STRINGS
 	PS_STRINGS->ps_nargvstr = 1;
 	PS_STRINGS->ps_argvstr = ps_buffer;
-#endif   /* PS_USE_PS_STRINGS */
+#endif							/* PS_USE_PS_STRINGS */
 
 #ifdef PS_USE_CLOBBER_ARGV
 	/* pad unused memory; need only clobber remainder of old status string */
@@ -344,7 +378,7 @@ set_ps_display(const char *activity, bool force)
 		MemSet(ps_buffer + ps_buffer_cur_len, PS_PADDING,
 			   last_status_len - ps_buffer_cur_len);
 	last_status_len = ps_buffer_cur_len;
-#endif   /* PS_USE_CLOBBER_ARGV */
+#endif							/* PS_USE_CLOBBER_ARGV */
 
 #ifdef PS_USE_WIN32
 	{
@@ -363,8 +397,8 @@ set_ps_display(const char *activity, bool force)
 
 		ident_handle = CreateEvent(NULL, TRUE, FALSE, name);
 	}
-#endif   /* PS_USE_WIN32 */
-#endif   /* not PS_USE_NONE */
+#endif							/* PS_USE_WIN32 */
+#endif							/* not PS_USE_NONE */
 }
 
 

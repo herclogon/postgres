@@ -25,6 +25,48 @@ select substring('asd TO foo' from ' TO (([a-z0-9._]+|"([^"]+|"")+")+)');
 select substring('a' from '((a))+');
 select substring('a' from '((a)+)');
 
+-- Test regexp_match()
+select regexp_match('abc', '');
+select regexp_match('abc', 'bc');
+select regexp_match('abc', 'd') is null;
+select regexp_match('abc', '(B)(c)', 'i');
+select regexp_match('abc', 'Bd', 'ig'); -- error
+
+-- Test lookahead constraints
+select regexp_matches('ab', 'a(?=b)b*');
+select regexp_matches('a', 'a(?=b)b*');
+select regexp_matches('abc', 'a(?=b)b*(?=c)c*');
+select regexp_matches('ab', 'a(?=b)b*(?=c)c*');
+select regexp_matches('ab', 'a(?!b)b*');
+select regexp_matches('a', 'a(?!b)b*');
+select regexp_matches('b', '(?=b)b');
+select regexp_matches('a', '(?=b)b');
+
+-- Test lookbehind constraints
+select regexp_matches('abb', '(?<=a)b*');
+select regexp_matches('a', 'a(?<=a)b*');
+select regexp_matches('abc', 'a(?<=a)b*(?<=b)c*');
+select regexp_matches('ab', 'a(?<=a)b*(?<=b)c*');
+select regexp_matches('ab', 'a*(?<!a)b*');
+select regexp_matches('ab', 'a*(?<!a)b+');
+select regexp_matches('b', 'a*(?<!a)b+');
+select regexp_matches('a', 'a(?<!a)b*');
+select regexp_matches('b', '(?<=b)b');
+select regexp_matches('foobar', '(?<=f)b+');
+select regexp_matches('foobar', '(?<=foo)b+');
+select regexp_matches('foobar', '(?<=oo)b+');
+
+-- Test optimization of single-chr-or-bracket-expression lookaround constraints
+select 'xz' ~ 'x(?=[xy])';
+select 'xy' ~ 'x(?=[xy])';
+select 'xz' ~ 'x(?![xy])';
+select 'xy' ~ 'x(?![xy])';
+select 'x'  ~ 'x(?![xy])';
+select 'xyy' ~ '(?<=[xy])yy+';
+select 'zyy' ~ '(?<=[xy])yy+';
+select 'xyy' ~ '(?<![xy])yy+';
+select 'zyy' ~ '(?<![xy])yy+';
+
 -- Test conversion of regex patterns to indexable conditions
 explain (costs off) select * from pg_proc where proname ~ 'abc';
 explain (costs off) select * from pg_proc where proname ~ '^abc';
@@ -82,3 +124,8 @@ select 'a' ~ '$()|^\1';
 select 'a' ~ '.. ()|\1';
 select 'a' ~ '()*\1';
 select 'a' ~ '()+\1';
+
+-- Error conditions
+select 'xyz' ~ 'x(\w)(?=\1)';  -- no backrefs in LACONs
+select 'xyz' ~ 'x(\w)(?=(\1))';
+select 'a' ~ '\x7fffffff';  -- invalid chr code

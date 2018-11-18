@@ -7,7 +7,7 @@
  * we need two sets of code.  Ought to look at trying to unify the cases.
  *
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -56,15 +56,7 @@ SubqueryNext(SubqueryScanState *node)
 	 * We just return the subplan's result slot, rather than expending extra
 	 * cycles for ExecCopySlot().  (Our own ScanTupleSlot is used only for
 	 * EvalPlanQual rechecks.)
-	 *
-	 * We do need to mark the slot contents read-only to prevent interference
-	 * between different functions reading the same datum from the slot. It's
-	 * a bit hokey to do this to the subplan's slot, but should be safe
-	 * enough.
 	 */
-	if (!TupIsNull(slot))
-		slot = ExecMakeSlotContentsReadOnly(slot);
-
 	return slot;
 }
 
@@ -87,9 +79,11 @@ SubqueryRecheck(SubqueryScanState *node, TupleTableSlot *slot)
  *		access method functions.
  * ----------------------------------------------------------------
  */
-TupleTableSlot *
-ExecSubqueryScan(SubqueryScanState *node)
+static TupleTableSlot *
+ExecSubqueryScan(PlanState *pstate)
 {
+	SubqueryScanState *node = castNode(SubqueryScanState, pstate);
+
 	return ExecScan(&node->ss,
 					(ExecScanAccessMtd) SubqueryNext,
 					(ExecScanRecheckMtd) SubqueryRecheck);
@@ -117,6 +111,7 @@ ExecInitSubqueryScan(SubqueryScan *node, EState *estate, int eflags)
 	subquerystate = makeNode(SubqueryScanState);
 	subquerystate->ss.ps.plan = (Plan *) node;
 	subquerystate->ss.ps.state = estate;
+	subquerystate->ss.ps.ExecProcNode = ExecSubqueryScan;
 
 	/*
 	 * Miscellaneous initialization
@@ -126,39 +121,38 @@ ExecInitSubqueryScan(SubqueryScan *node, EState *estate, int eflags)
 	ExecAssignExprContext(estate, &subquerystate->ss.ps);
 
 	/*
-	 * initialize child expressions
-	 */
-	subquerystate->ss.ps.targetlist = (List *)
-		ExecInitExpr((Expr *) node->scan.plan.targetlist,
-					 (PlanState *) subquerystate);
-	subquerystate->ss.ps.qual = (List *)
-		ExecInitExpr((Expr *) node->scan.plan.qual,
-					 (PlanState *) subquerystate);
-
-	/*
-	 * tuple table initialization
-	 */
-	ExecInitResultTupleSlot(estate, &subquerystate->ss.ps);
-	ExecInitScanTupleSlot(estate, &subquerystate->ss);
-
-	/*
 	 * initialize subquery
 	 */
 	subquerystate->subplan = ExecInitNode(node->subplan, estate, eflags);
 
-	subquerystate->ss.ps.ps_TupFromTlist = false;
+	/*
+	 * Initialize scan slot and type (needed by ExecAssignScanProjectionInfo)
+	 */
+	ExecInitScanTupleSlot(estate, &subquerystate->ss,
+						  ExecGetResultType(subquerystate->subplan),
+						  ExecGetResultSlotOps(subquerystate->subplan, NULL));
+	/*
+	 * The slot used as the scantuple isn't the slot above (outside of EPQ),
+	 * but the one from the node below.
+	 */
+	subquerystate->ss.ps.scanopsset = true;
+	subquerystate->ss.ps.scanops = ExecGetResultSlotOps(subquerystate->subplan,
+														&subquerystate->ss.ps.scanopsfixed);
+	subquerystate->ss.ps.resultopsset = true;
+	subquerystate->ss.ps.resultops = subquerystate->ss.ps.scanops;
+	subquerystate->ss.ps.resultopsfixed = subquerystate->ss.ps.scanopsfixed;
 
 	/*
-	 * Initialize scan tuple type (needed by ExecAssignScanProjectionInfo)
+	 * Initialize result type and projection.
 	 */
-	ExecAssignScanType(&subquerystate->ss,
-					   ExecGetResultType(subquerystate->subplan));
-
-	/*
-	 * Initialize result tuple type and projection info.
-	 */
-	ExecAssignResultTypeFromTL(&subquerystate->ss.ps);
+	ExecInitResultTypeTL(&subquerystate->ss.ps);
 	ExecAssignScanProjectionInfo(&subquerystate->ss);
+
+	/*
+	 * initialize child expressions
+	 */
+	subquerystate->ss.ps.qual =
+		ExecInitQual(node->scan.plan.qual, (PlanState *) subquerystate);
 
 	return subquerystate;
 }
@@ -180,7 +174,8 @@ ExecEndSubqueryScan(SubqueryScanState *node)
 	/*
 	 * clean out the upper tuple table
 	 */
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
 	/*

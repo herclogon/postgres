@@ -3,7 +3,7 @@
  * genam.c
  *	  general index access method routines
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -83,7 +83,7 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
 
 	scan->heapRelation = NULL;	/* may be set later */
 	scan->indexRelation = indexRelation;
-	scan->xs_snapshot = InvalidSnapshot;		/* caller must initialize this */
+	scan->xs_snapshot = InvalidSnapshot;	/* caller must initialize this */
 	scan->numberOfKeys = nkeys;
 	scan->numberOfOrderBys = norderbys;
 
@@ -119,6 +119,8 @@ RelationGetIndexScan(Relation indexRelation, int nkeys, int norderbys)
 
 	scan->xs_itup = NULL;
 	scan->xs_itupdesc = NULL;
+	scan->xs_hitup = NULL;
+	scan->xs_hitupdesc = NULL;
 
 	ItemPointerSetInvalid(&scan->xs_ctup.t_self);
 	scan->xs_ctup.t_data = NULL;
@@ -156,7 +158,8 @@ IndexScanEnd(IndexScanDesc scan)
  *
  * Construct a string describing the contents of an index entry, in the
  * form "(key_name, ...)=(key_value, ...)".  This is currently used
- * for building unique-constraint and exclusion-constraint error messages.
+ * for building unique-constraint and exclusion-constraint error messages,
+ * so only key columns of the index are checked and printed.
  *
  * Note that if the user does not have permissions to view all of the
  * columns involved then a NULL is returned.  Returning a partial key seems
@@ -166,6 +169,10 @@ IndexScanEnd(IndexScanDesc scan)
  * The passed-in values/nulls arrays are the "raw" input to the index AM,
  * e.g. results of FormIndexDatum --- this is not necessarily what is stored
  * in the index, but it's what the user perceives to be stored.
+ *
+ * Note: if you change anything here, check whether
+ * ExecBuildSlotPartitionKeyDescription() in execMain.c needs a similar
+ * change.
  */
 char *
 BuildIndexValueDescription(Relation indexRelation,
@@ -173,13 +180,14 @@ BuildIndexValueDescription(Relation indexRelation,
 {
 	StringInfoData buf;
 	Form_pg_index idxrec;
-	HeapTuple	ht_idx;
-	int			natts = indexRelation->rd_rel->relnatts;
+	int			indnkeyatts;
 	int			i;
 	int			keyno;
 	Oid			indexrelid = RelationGetRelid(indexRelation);
 	Oid			indrelid;
 	AclResult	aclresult;
+
+	indnkeyatts = IndexRelationGetNumberOfKeyAttributes(indexRelation);
 
 	/*
 	 * Check permissions- if the user does not have access to view all of the
@@ -191,24 +199,13 @@ BuildIndexValueDescription(Relation indexRelation,
 	 * Next we need to check table-level SELECT access and then, if there is
 	 * no access there, check column-level permissions.
 	 */
-
-	/*
-	 * Fetch the pg_index tuple by the Oid of the index
-	 */
-	ht_idx = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indexrelid));
-	if (!HeapTupleIsValid(ht_idx))
-		elog(ERROR, "cache lookup failed for index %u", indexrelid);
-	idxrec = (Form_pg_index) GETSTRUCT(ht_idx);
-
+	idxrec = indexRelation->rd_index;
 	indrelid = idxrec->indrelid;
 	Assert(indexrelid == idxrec->indexrelid);
 
 	/* RLS check- if RLS is enabled then we don't return anything. */
 	if (check_enable_rls(indrelid, InvalidOid, true) == RLS_ENABLED)
-	{
-		ReleaseSysCache(ht_idx);
 		return NULL;
-	}
 
 	/* Table-level SELECT is enough, if the user has it */
 	aclresult = pg_class_aclcheck(indrelid, GetUserId(), ACL_SELECT);
@@ -218,7 +215,7 @@ BuildIndexValueDescription(Relation indexRelation,
 		 * No table-level access, so step through the columns in the index and
 		 * make sure the user has SELECT rights on all of them.
 		 */
-		for (keyno = 0; keyno < idxrec->indnatts; keyno++)
+		for (keyno = 0; keyno < indnkeyatts; keyno++)
 		{
 			AttrNumber	attnum = idxrec->indkey.values[keyno];
 
@@ -233,18 +230,16 @@ BuildIndexValueDescription(Relation indexRelation,
 									  ACL_SELECT) != ACLCHECK_OK)
 			{
 				/* No access, so clean up and return */
-				ReleaseSysCache(ht_idx);
 				return NULL;
 			}
 		}
 	}
-	ReleaseSysCache(ht_idx);
 
 	initStringInfo(&buf);
 	appendStringInfo(&buf, "(%s)=(",
 					 pg_get_indexdef_columns(indexrelid, true));
 
-	for (i = 0; i < natts; i++)
+	for (i = 0; i < indnkeyatts; i++)
 	{
 		char	   *val;
 
@@ -362,7 +357,7 @@ systable_beginscan(Relation heapRelation,
 		{
 			int			j;
 
-			for (j = 0; j < irel->rd_index->indnatts; j++)
+			for (j = 0; j < IndexRelationGetNumberOfAttributes(irel); j++)
 			{
 				if (key[i].sk_attno == irel->rd_index->indkey.values[j])
 				{
@@ -370,7 +365,7 @@ systable_beginscan(Relation heapRelation,
 					break;
 				}
 			}
-			if (j == irel->rd_index->indnatts)
+			if (j == IndexRelationGetNumberOfAttributes(irel))
 				elog(ERROR, "column is not in index");
 		}
 
@@ -564,7 +559,7 @@ systable_beginscan_ordered(Relation heapRelation,
 	{
 		int			j;
 
-		for (j = 0; j < indexRelation->rd_index->indnatts; j++)
+		for (j = 0; j < IndexRelationGetNumberOfAttributes(indexRelation); j++)
 		{
 			if (key[i].sk_attno == indexRelation->rd_index->indkey.values[j])
 			{
@@ -572,7 +567,7 @@ systable_beginscan_ordered(Relation heapRelation,
 				break;
 			}
 		}
-		if (j == indexRelation->rd_index->indnatts)
+		if (j == IndexRelationGetNumberOfAttributes(indexRelation))
 			elog(ERROR, "column is not in index");
 	}
 

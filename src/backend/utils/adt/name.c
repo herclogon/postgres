@@ -9,7 +9,7 @@
  * always use NAMEDATALEN as the symbolic constant!   - jolly 8/21/95
  *
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -188,7 +188,7 @@ namege(PG_FUNCTION_ARGS)
 /* (see char.c for comparison/operation routines) */
 
 int
-namecpy(Name n1, Name n2)
+namecpy(Name n1, const NameData *n2)
 {
 	if (!n1 || !n2)
 		return -1;
@@ -200,8 +200,7 @@ namecpy(Name n1, Name n2)
 int
 namecat(Name n1, Name n2)
 {
-	return namestrcat(n1, NameStr(*n2));		/* n2 can't be any longer than
-												 * n1 */
+	return namestrcat(n1, NameStr(*n2));	/* n2 can't be any longer than n1 */
 }
 #endif
 
@@ -317,9 +316,9 @@ current_schemas(PG_FUNCTION_ARGS)
 
 	array = construct_array(names, i,
 							NAMEOID,
-							NAMEDATALEN,		/* sizeof(Name) */
-							false,		/* Name is not by-val */
-							'c');		/* alignment of Name */
+							NAMEDATALEN,	/* sizeof(Name) */
+							false,	/* Name is not by-val */
+							'c');	/* alignment of Name */
 
 	PG_RETURN_POINTER(array);
 }

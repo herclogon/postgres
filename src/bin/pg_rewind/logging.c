@@ -3,7 +3,7 @@
  * logging.c
  *	 logging functions
  *
- *	Copyright (c) 2010-2015, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2018, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -25,8 +25,6 @@ static pg_time_t last_progress_report = 0;
 
 #define QUERY_ALLOC			8192
 
-#define MESSAGE_WIDTH		60
-
 static
 pg_attribute_printf(2, 0)
 void
@@ -34,26 +32,26 @@ pg_log_v(eLogType type, const char *fmt, va_list ap)
 {
 	char		message[QUERY_ALLOC];
 
-	vsnprintf(message, sizeof(message), fmt, ap);
+	vsnprintf(message, sizeof(message), _(fmt), ap);
 
 	switch (type)
 	{
 		case PG_DEBUG:
 			if (debug)
-				printf("%s", _(message));
+				printf("%s", message);
 			break;
 
 		case PG_PROGRESS:
 			if (showprogress)
-				printf("%s", _(message));
+				printf("%s", message);
 			break;
 
 		case PG_WARNING:
-			printf("%s", _(message));
+			printf("%s", message);
 			break;
 
 		case PG_FATAL:
-			printf("\n%s", _(message));
+			printf("\n%s", message);
 			printf("%s", _("Failure, exiting\n"));
 			exit(1);
 			break;

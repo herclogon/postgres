@@ -5,7 +5,7 @@
  *		bits of hard-wired knowledge
  *
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -36,7 +36,9 @@
 #include "catalog/pg_shdepend.h"
 #include "catalog/pg_shdescription.h"
 #include "catalog/pg_shseclabel.h"
+#include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/pg_type.h"
 #include "catalog/toasting.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -118,7 +120,7 @@ IsCatalogClass(Oid relid, Form_pg_class reltuple)
 	 * this is noticeably cheaper and doesn't require catalog access.
 	 *
 	 * This test is safe since even an oid wraparound will preserve this
-	 * property (c.f. GetNewObjectId()) and it has the advantage that it works
+	 * property (cf. GetNewObjectId()) and it has the advantage that it works
 	 * correctly even if a user decides to create a relation in the pg_catalog
 	 * namespace.
 	 * ----
@@ -184,8 +186,9 @@ IsToastNamespace(Oid namespaceId)
  *		True iff name starts with the pg_ prefix.
  *
  *		For some classes of objects, the prefix pg_ is reserved for
- *		system objects only.  As of 8.0, this is only true for
- *		schema and tablespace names.
+ *		system objects only.  As of 8.0, this was only true for
+ *		schema and tablespace names.  With 9.6, this is also true
+ *		for roles.
  */
 bool
 IsReservedName(const char *name)
@@ -226,7 +229,8 @@ IsSharedRelation(Oid relationId)
 		relationId == SharedSecLabelRelationId ||
 		relationId == TableSpaceRelationId ||
 		relationId == DbRoleSettingRelationId ||
-		relationId == ReplicationOriginRelationId)
+		relationId == ReplicationOriginRelationId ||
+		relationId == SubscriptionRelationId)
 		return true;
 	/* These are their indexes (see indexing.h) */
 	if (relationId == AuthIdRolnameIndexId ||
@@ -244,15 +248,29 @@ IsSharedRelation(Oid relationId)
 		relationId == TablespaceNameIndexId ||
 		relationId == DbRoleSettingDatidRolidIndexId ||
 		relationId == ReplicationOriginIdentIndex ||
-		relationId == ReplicationOriginNameIndex)
+		relationId == ReplicationOriginNameIndex ||
+		relationId == SubscriptionObjectIndexId ||
+		relationId == SubscriptionNameIndexId)
 		return true;
 	/* These are their toast tables and toast indexes (see toasting.h) */
-	if (relationId == PgShdescriptionToastTable ||
-		relationId == PgShdescriptionToastIndex ||
+	if (relationId == PgAuthidToastTable ||
+		relationId == PgAuthidToastIndex ||
+		relationId == PgDatabaseToastTable ||
+		relationId == PgDatabaseToastIndex ||
 		relationId == PgDbRoleSettingToastTable ||
 		relationId == PgDbRoleSettingToastIndex ||
+		relationId == PgPlTemplateToastTable ||
+		relationId == PgPlTemplateToastIndex ||
+		relationId == PgReplicationOriginToastTable ||
+		relationId == PgReplicationOriginToastIndex ||
+		relationId == PgShdescriptionToastTable ||
+		relationId == PgShdescriptionToastIndex ||
 		relationId == PgShseclabelToastTable ||
-		relationId == PgShseclabelToastIndex)
+		relationId == PgShseclabelToastIndex ||
+		relationId == PgSubscriptionToastTable ||
+		relationId == PgSubscriptionToastIndex ||
+		relationId == PgTablespaceToastTable ||
+		relationId == PgTablespaceToastIndex)
 		return true;
 	return false;
 }
@@ -276,8 +294,12 @@ IsSharedRelation(Oid relationId)
  * managed to cycle through 2^32 OIDs and generate the same OID before we
  * finish inserting our row.  This seems unlikely to be a problem.  Note
  * that if we had to *commit* the row to end the race condition, the risk
- * would be rather higher; therefore we use SnapshotDirty in the test,
- * so that we will see uncommitted rows.
+ * would be rather higher; therefore we use SnapshotAny in the test, so that
+ * we will see uncommitted rows.  (We used to use SnapshotDirty, but that has
+ * the disadvantage that it ignores recently-deleted rows, creating a risk
+ * of transient conflicts for as long as our own MVCC snapshots think a
+ * recently-deleted row is live.  The risk is far higher when selecting TOAST
+ * OIDs, because SnapshotToast considers dead rows as active indefinitely.)
  */
 Oid
 GetNewOid(Relation relation)
@@ -330,12 +352,17 @@ Oid
 GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 {
 	Oid			newOid;
-	SnapshotData SnapshotDirty;
 	SysScanDesc scan;
 	ScanKeyData key;
 	bool		collides;
 
-	InitDirtySnapshot(SnapshotDirty);
+	/*
+	 * We should never be asked to generate a new pg_type OID during
+	 * pg_upgrade; doing so would risk collisions with the OIDs it wants to
+	 * assign.  Hitting this assert means there's some path where we failed to
+	 * ensure that a type OID is determined by commands in the dump script.
+	 */
+	Assert(!IsBinaryUpgrade || RelationGetRelid(relation) != TypeRelationId);
 
 	/* Generate new OIDs until we find one not in the table */
 	do
@@ -349,9 +376,9 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
 					BTEqualStrategyNumber, F_OIDEQ,
 					ObjectIdGetDatum(newOid));
 
-		/* see notes above about using SnapshotDirty */
+		/* see notes above about using SnapshotAny */
 		scan = systable_beginscan(relation, indexId, true,
-								  &SnapshotDirty, 1, &key);
+								  SnapshotAny, 1, &key);
 
 		collides = HeapTupleIsValid(systable_getnext(scan));
 
@@ -382,14 +409,20 @@ GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
 {
 	RelFileNodeBackend rnode;
 	char	   *rpath;
-	int			fd;
 	bool		collides;
 	BackendId	backend;
+
+	/*
+	 * If we ever get here during pg_upgrade, there's something wrong; all
+	 * relfilenode assignments during a binary-upgrade run should be
+	 * determined by commands in the dump script.
+	 */
+	Assert(!IsBinaryUpgrade);
 
 	switch (relpersistence)
 	{
 		case RELPERSISTENCE_TEMP:
-			backend = MyBackendId;
+			backend = BackendIdForTempRelations();
 			break;
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
@@ -423,12 +456,10 @@ GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
 
 		/* Check for existing file of same name */
 		rpath = relpath(rnode, MAIN_FORKNUM);
-		fd = BasicOpenFile(rpath, O_RDONLY | PG_BINARY, 0);
 
-		if (fd >= 0)
+		if (access(rpath, F_OK) == 0)
 		{
 			/* definite collision */
-			close(fd);
 			collides = true;
 		}
 		else
@@ -436,13 +467,9 @@ GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
 			/*
 			 * Here we have a little bit of a dilemma: if errno is something
 			 * other than ENOENT, should we declare a collision and loop? In
-			 * particular one might think this advisable for, say, EPERM.
-			 * However there really shouldn't be any unreadable files in a
-			 * tablespace directory, and if the EPERM is actually complaining
-			 * that we can't read the directory itself, we'd be in an infinite
-			 * loop.  In practice it seems best to go ahead regardless of the
-			 * errno.  If there is a colliding file we will get an smgr
-			 * failure when we attempt to create the new relation file.
+			 * practice it seems best to go ahead regardless of the errno.  If
+			 * there is a colliding file we will get an smgr failure when we
+			 * attempt to create the new relation file.
 			 */
 			collides = false;
 		}

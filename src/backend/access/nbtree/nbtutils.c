@@ -3,7 +3,7 @@
  * nbtutils.c
  *	  Utility code for Postgres btree implementation.
  *
- * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -63,17 +63,28 @@ _bt_mkscankey(Relation rel, IndexTuple itup)
 {
 	ScanKey		skey;
 	TupleDesc	itupdesc;
-	int			natts;
+	int			indnatts PG_USED_FOR_ASSERTS_ONLY;
+	int			indnkeyatts;
 	int16	   *indoption;
 	int			i;
 
 	itupdesc = RelationGetDescr(rel);
-	natts = RelationGetNumberOfAttributes(rel);
+	indnatts = IndexRelationGetNumberOfAttributes(rel);
+	indnkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
 	indoption = rel->rd_indoption;
 
-	skey = (ScanKey) palloc(natts * sizeof(ScanKeyData));
+	Assert(indnkeyatts > 0);
+	Assert(indnkeyatts <= indnatts);
+	Assert(BTreeTupleGetNAtts(itup, rel) == indnatts ||
+		   BTreeTupleGetNAtts(itup, rel) == indnkeyatts);
 
-	for (i = 0; i < natts; i++)
+	/*
+	 * We'll execute search using scan key constructed on key columns. Non-key
+	 * (INCLUDE index) columns are always omitted from scan keys.
+	 */
+	skey = (ScanKey) palloc(indnkeyatts * sizeof(ScanKeyData));
+
+	for (i = 0; i < indnkeyatts; i++)
 	{
 		FmgrInfo   *procinfo;
 		Datum		arg;
@@ -115,16 +126,16 @@ ScanKey
 _bt_mkscankey_nodata(Relation rel)
 {
 	ScanKey		skey;
-	int			natts;
+	int			indnkeyatts;
 	int16	   *indoption;
 	int			i;
 
-	natts = RelationGetNumberOfAttributes(rel);
+	indnkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
 	indoption = rel->rd_indoption;
 
-	skey = (ScanKey) palloc(natts * sizeof(ScanKeyData));
+	skey = (ScanKey) palloc(indnkeyatts * sizeof(ScanKeyData));
 
-	for (i = 0; i < natts; i++)
+	for (i = 0; i < indnkeyatts; i++)
 	{
 		FmgrInfo   *procinfo;
 		int			flags;
@@ -232,10 +243,8 @@ _bt_preprocess_array_keys(IndexScanDesc scan)
 	 */
 	if (so->arrayContext == NULL)
 		so->arrayContext = AllocSetContextCreate(CurrentMemoryContext,
-												 "BTree Array Context",
-												 ALLOCSET_SMALL_MINSIZE,
-												 ALLOCSET_SMALL_INITSIZE,
-												 ALLOCSET_SMALL_MAXSIZE);
+												 "BTree array context",
+												 ALLOCSET_SMALL_SIZES);
 	else
 		MemoryContextReset(so->arrayContext);
 
@@ -338,7 +347,7 @@ _bt_preprocess_array_keys(IndexScanDesc scan)
 		 * successive primitive indexscans produce data in index order.
 		 */
 		num_elems = _bt_sort_array_elements(scan, cur,
-						(indoption[cur->sk_attno - 1] & INDOPTION_DESC) != 0,
+											(indoption[cur->sk_attno - 1] & INDOPTION_DESC) != 0,
 											elem_values, num_nonnulls);
 
 		/*
@@ -509,7 +518,7 @@ _bt_compare_array_elements(const void *a, const void *b, void *arg)
 											  cxt->collation,
 											  da, db));
 	if (cxt->reverse)
-		compare = -compare;
+		INVERT_COMPARE_RESULT(compare);
 	return compare;
 }
 
@@ -542,8 +551,8 @@ _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir)
 /*
  * _bt_advance_array_keys() -- Advance to next set of array elements
  *
- * Returns TRUE if there is another set of values to consider, FALSE if not.
- * On TRUE result, the scankeys are initialized with the next set of values.
+ * Returns true if there is another set of values to consider, false if not.
+ * On true result, the scankeys are initialized with the next set of values.
  */
 bool
 _bt_advance_array_keys(IndexScanDesc scan, ScanDirection dir)
@@ -591,6 +600,10 @@ _bt_advance_array_keys(IndexScanDesc scan, ScanDirection dir)
 		if (found)
 			break;
 	}
+
+	/* advance parallel scan */
+	if (scan->parallel_scan != NULL)
+		_bt_parallel_advance_array_keys(scan);
 
 	return found;
 }
@@ -722,7 +735,7 @@ _bt_restore_array_keys(IndexScanDesc scan)
  * for a forward scan; or after the last match for a backward scan.)
  *
  * As a byproduct of this work, we can detect contradictory quals such
- * as "x = 1 AND x > 2".  If we see that, we return so->qual_ok = FALSE,
+ * as "x = 1 AND x > 2".  If we see that, we return so->qual_ok = false,
  * indicating the scan need not be run at all since no tuples can match.
  * (In this case we do not bother completing the output key array!)
  * Again, missing cross-type operators might cause us to fail to prove the
@@ -1018,7 +1031,7 @@ _bt_preprocess_keys(IndexScanDesc scan)
  *
  * If the opfamily doesn't supply a complete set of cross-type operators we
  * may not be able to make the comparison.  If we can make the comparison
- * we store the operator result in *result and return TRUE.  We return FALSE
+ * we store the operator result in *result and return true.  We return false
  * if the comparison could not be made.
  *
  * Note: op always points at the same ScanKey as either leftarg or rightarg.
@@ -1161,7 +1174,7 @@ _bt_compare_scankey_args(IndexScanDesc scan, ScanKey op,
 			*result = DatumGetBool(OidFunctionCall2Coll(cmp_proc,
 														op->sk_collation,
 														leftarg->sk_argument,
-													 rightarg->sk_argument));
+														rightarg->sk_argument));
 			return true;
 		}
 	}
@@ -1183,8 +1196,8 @@ _bt_compare_scankey_args(IndexScanDesc scan, ScanKey op,
  *
  * Lastly, for ordinary scankeys (not IS NULL/NOT NULL), we check for a
  * NULL comparison value.  Since all btree operators are assumed strict,
- * a NULL means that the qual cannot be satisfied.  We return TRUE if the
- * comparison value isn't NULL, or FALSE if the scan should be abandoned.
+ * a NULL means that the qual cannot be satisfied.  We return true if the
+ * comparison value isn't NULL, or false if the scan should be abandoned.
  *
  * This function is applied to the *input* scankey structure; therefore
  * on a rescan we will be looking at already-processed scankeys.  Hence
@@ -1285,12 +1298,9 @@ _bt_fix_scankey_strategy(ScanKey skey, int16 *indoption)
  *
  * Depending on the operator type, the key may be required for both scan
  * directions or just one.  Also, if the key is a row comparison header,
- * we have to mark the appropriate subsidiary ScanKeys as required.  In
- * such cases, the first subsidiary key is required, but subsequent ones
- * are required only as long as they correspond to successive index columns
- * and match the leading column as to sort direction.
- * Otherwise the row comparison ordering is different from the index ordering
- * and so we can't stop the scan on the basis of those lower-order columns.
+ * we have to mark its first subsidiary ScanKey as required.  (Subsequent
+ * subsidiary ScanKeys are normally for lower-order columns, and thus
+ * cannot be required, since they're after the first non-equality scankey.)
  *
  * Note: when we set required-key flag bits in a subsidiary scankey, we are
  * scribbling on a data structure belonging to the index AM's caller, not on
@@ -1328,24 +1338,12 @@ _bt_mark_scankey_required(ScanKey skey)
 	if (skey->sk_flags & SK_ROW_HEADER)
 	{
 		ScanKey		subkey = (ScanKey) DatumGetPointer(skey->sk_argument);
-		AttrNumber	attno = skey->sk_attno;
 
-		/* First subkey should be same as the header says */
-		Assert(subkey->sk_attno == attno);
-
-		for (;;)
-		{
-			Assert(subkey->sk_flags & SK_ROW_MEMBER);
-			if (subkey->sk_attno != attno)
-				break;			/* non-adjacent key, so not required */
-			if (subkey->sk_strategy != skey->sk_strategy)
-				break;			/* wrong direction, so not required */
-			subkey->sk_flags |= addflags;
-			if (subkey->sk_flags & SK_ROW_END)
-				break;
-			subkey++;
-			attno++;
-		}
+		/* First subkey should be same column/operator as the header */
+		Assert(subkey->sk_flags & SK_ROW_MEMBER);
+		Assert(subkey->sk_attno == skey->sk_attno);
+		Assert(subkey->sk_strategy == skey->sk_strategy);
+		subkey->sk_flags |= addflags;
 	}
 }
 
@@ -1429,13 +1427,7 @@ _bt_checkkeys(IndexScanDesc scan,
 		bool		isNull;
 		Datum		test;
 
-		/*
-		 * If the scan key has already matched we can skip this key, as long
-		 * as the index tuple does not contain NULL values.
-		 */
-		if (key->sk_flags & SK_BT_MATCHED && !IndexTupleHasNulls(tuple))
-			continue;
-
+		Assert(key->sk_attno <= BTreeTupleGetNAtts(tuple, scan->indexRelation));
 		/* row-comparison keys need special processing */
 		if (key->sk_flags & SK_ROW_HEADER)
 		{
@@ -1660,7 +1652,7 @@ _bt_check_rowcompare(ScanKey skey, IndexTuple tuple, TupleDesc tupdesc,
 													subkey->sk_argument));
 
 		if (subkey->sk_flags & SK_BT_DESC)
-			cmpresult = -cmpresult;
+			INVERT_COMPARE_RESULT(cmpresult);
 
 		/* Done comparing if unequal, else advance to next column */
 		if (cmpresult != 0)
@@ -1792,7 +1784,7 @@ _bt_killitems(IndexScanDesc scan)
 			return;
 
 		page = BufferGetPage(buf);
-		if (PageGetLSN(page) == so->currPos.lsn)
+		if (BufferGetLSNAtomic(buf) == so->currPos.lsn)
 			so->currPos.buf = buf;
 		else
 		{
@@ -2058,15 +2050,167 @@ BTreeShmemInit(void)
 		Assert(found);
 }
 
-Datum
-btoptions(PG_FUNCTION_ARGS)
+bytea *
+btoptions(Datum reloptions, bool validate)
 {
-	Datum		reloptions = PG_GETARG_DATUM(0);
-	bool		validate = PG_GETARG_BOOL(1);
-	bytea	   *result;
+	return default_reloptions(reloptions, validate, RELOPT_KIND_BTREE);
+}
 
-	result = default_reloptions(reloptions, validate, RELOPT_KIND_BTREE);
-	if (result)
-		PG_RETURN_BYTEA_P(result);
-	PG_RETURN_NULL();
+/*
+ *	btproperty() -- Check boolean properties of indexes.
+ *
+ * This is optional, but handling AMPROP_RETURNABLE here saves opening the rel
+ * to call btcanreturn.
+ */
+bool
+btproperty(Oid index_oid, int attno,
+		   IndexAMProperty prop, const char *propname,
+		   bool *res, bool *isnull)
+{
+	switch (prop)
+	{
+		case AMPROP_RETURNABLE:
+			/* answer only for columns, not AM or whole index */
+			if (attno == 0)
+				return false;
+			/* otherwise, btree can always return data */
+			*res = true;
+			return true;
+
+		default:
+			return false;		/* punt to generic code */
+	}
+}
+
+/*
+ *	_bt_nonkey_truncate() -- create tuple without non-key suffix attributes.
+ *
+ * Returns truncated index tuple allocated in caller's memory context, with key
+ * attributes copied from caller's itup argument.  Currently, suffix truncation
+ * is only performed to create pivot tuples in INCLUDE indexes, but some day it
+ * could be generalized to remove suffix attributes after the first
+ * distinguishing key attribute.
+ *
+ * Truncated tuple is guaranteed to be no larger than the original, which is
+ * important for staying under the 1/3 of a page restriction on tuple size.
+ *
+ * Note that returned tuple's t_tid offset will hold the number of attributes
+ * present, so the original item pointer offset is not represented.  Caller
+ * should only change truncated tuple's downlink.
+ */
+IndexTuple
+_bt_nonkey_truncate(Relation rel, IndexTuple itup)
+{
+	int			nkeyattrs = IndexRelationGetNumberOfKeyAttributes(rel);
+	IndexTuple	truncated;
+
+	/*
+	 * We should only ever truncate leaf index tuples, which must have both
+	 * key and non-key attributes.  It's never okay to truncate a second time.
+	 */
+	Assert(BTreeTupleGetNAtts(itup, rel) ==
+		   IndexRelationGetNumberOfAttributes(rel));
+
+	truncated = index_truncate_tuple(RelationGetDescr(rel), itup, nkeyattrs);
+	BTreeTupleSetNAtts(truncated, nkeyattrs);
+
+	return truncated;
+}
+
+/*
+ *  _bt_check_natts() -- Verify tuple has expected number of attributes.
+ *
+ * Returns value indicating if the expected number of attributes were found
+ * for a particular offset on page.  This can be used as a general purpose
+ * sanity check.
+ *
+ * Testing a tuple directly with BTreeTupleGetNAtts() should generally be
+ * preferred to calling here.  That's usually more convenient, and is always
+ * more explicit.  Call here instead when offnum's tuple may be a negative
+ * infinity tuple that uses the pre-v11 on-disk representation, or when a low
+ * context check is appropriate.
+ */
+bool
+_bt_check_natts(Relation rel, Page page, OffsetNumber offnum)
+{
+	int16		natts = IndexRelationGetNumberOfAttributes(rel);
+	int16		nkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
+	BTPageOpaque opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	IndexTuple	itup;
+
+	/*
+	 * We cannot reliably test a deleted or half-deleted page, since they have
+	 * dummy high keys
+	 */
+	if (P_IGNORE(opaque))
+		return true;
+
+	Assert(offnum >= FirstOffsetNumber &&
+		   offnum <= PageGetMaxOffsetNumber(page));
+
+	/*
+	 * Mask allocated for number of keys in index tuple must be able to fit
+	 * maximum possible number of index attributes
+	 */
+	StaticAssertStmt(BT_N_KEYS_OFFSET_MASK >= INDEX_MAX_KEYS,
+					 "BT_N_KEYS_OFFSET_MASK can't fit INDEX_MAX_KEYS");
+
+	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
+
+	if (P_ISLEAF(opaque))
+	{
+		if (offnum >= P_FIRSTDATAKEY(opaque))
+		{
+			/*
+			 * Leaf tuples that are not the page high key (non-pivot tuples)
+			 * should never be truncated
+			 */
+			return BTreeTupleGetNAtts(itup, rel) == natts;
+		}
+		else
+		{
+			/*
+			 * Rightmost page doesn't contain a page high key, so tuple was
+			 * checked above as ordinary leaf tuple
+			 */
+			Assert(!P_RIGHTMOST(opaque));
+
+			/* Page high key tuple contains only key attributes */
+			return BTreeTupleGetNAtts(itup, rel) == nkeyatts;
+		}
+	}
+	else						/* !P_ISLEAF(opaque) */
+	{
+		if (offnum == P_FIRSTDATAKEY(opaque))
+		{
+			/*
+			 * The first tuple on any internal page (possibly the first after
+			 * its high key) is its negative infinity tuple.  Negative
+			 * infinity tuples are always truncated to zero attributes.  They
+			 * are a particular kind of pivot tuple.
+			 *
+			 * The number of attributes won't be explicitly represented if the
+			 * negative infinity tuple was generated during a page split that
+			 * occurred with a version of Postgres before v11.  There must be
+			 * a problem when there is an explicit representation that is
+			 * non-zero, or when there is no explicit representation and the
+			 * tuple is evidently not a pre-pg_upgrade tuple.
+			 *
+			 * Prior to v11, downlinks always had P_HIKEY as their offset. Use
+			 * that to decide if the tuple is a pre-v11 tuple.
+			 */
+			return BTreeTupleGetNAtts(itup, rel) == 0 ||
+				((itup->t_info & INDEX_ALT_TID_MASK) == 0 &&
+				 ItemPointerGetOffsetNumber(&(itup->t_tid)) == P_HIKEY);
+		}
+		else
+		{
+			/*
+			 * Tuple contains only key attributes despite on is it page high
+			 * key or not
+			 */
+			return BTreeTupleGetNAtts(itup, rel) == nkeyatts;
+		}
+
+	}
 }

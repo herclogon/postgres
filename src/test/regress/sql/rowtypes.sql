@@ -27,6 +27,9 @@ select '(Joe,"Blow,Jr")'::fullname;
 select '(Joe,)'::fullname;	-- ok, null 2nd column
 select '(Joe)'::fullname;	-- bad
 select '(Joe,,)'::fullname;	-- bad
+select '[]'::fullname;          -- bad
+select ' (Joe,Blow)  '::fullname;  -- ok, extra whitespace
+select '(Joe,Blow) /'::fullname;  -- bad
 
 create temp table quadtable(f1 int, q quad);
 
@@ -116,6 +119,21 @@ select thousand, tenthous from tenk1
 where (thousand, tenthous) >= (997, 5000)
 order by thousand, tenthous;
 
+-- Test case for bug #14010: indexed row comparisons fail with nulls
+create temp table test_table (a text, b text);
+insert into test_table values ('a', 'b');
+insert into test_table select 'a', null from generate_series(1,1000);
+insert into test_table values ('b', 'a');
+create index on test_table (a,b);
+set enable_sort = off;
+
+explain (costs off)
+select a,b from test_table where (a,b) > ('a','a') order by a,b;
+
+select a,b from test_table where (a,b) > ('a','a') order by a,b;
+
+reset enable_sort;
+
 -- Check row comparisons with IN
 select * from int8_tbl i8 where i8 in (row(123,456));  -- fail, type mismatch
 
@@ -144,6 +162,105 @@ create temp table cc (f1 cantcompare);
 insert into cc values('("(1,2)",3)');
 insert into cc values('("(4,5)",6)');
 select * from cc order by f1; -- fail, but should complain about cantcompare
+
+--
+-- Tests for record_{eq,cmp}
+--
+
+create type testtype1 as (a int, b int);
+
+-- all true
+select row(1, 2)::testtype1 < row(1, 3)::testtype1;
+select row(1, 2)::testtype1 <= row(1, 3)::testtype1;
+select row(1, 2)::testtype1 = row(1, 2)::testtype1;
+select row(1, 2)::testtype1 <> row(1, 3)::testtype1;
+select row(1, 3)::testtype1 >= row(1, 2)::testtype1;
+select row(1, 3)::testtype1 > row(1, 2)::testtype1;
+
+-- all false
+select row(1, -2)::testtype1 < row(1, -3)::testtype1;
+select row(1, -2)::testtype1 <= row(1, -3)::testtype1;
+select row(1, -2)::testtype1 = row(1, -3)::testtype1;
+select row(1, -2)::testtype1 <> row(1, -2)::testtype1;
+select row(1, -3)::testtype1 >= row(1, -2)::testtype1;
+select row(1, -3)::testtype1 > row(1, -2)::testtype1;
+
+-- true, but see *< below
+select row(1, -2)::testtype1 < row(1, 3)::testtype1;
+
+-- mismatches
+create type testtype3 as (a int, b text);
+select row(1, 2)::testtype1 < row(1, 'abc')::testtype3;
+select row(1, 2)::testtype1 <> row(1, 'abc')::testtype3;
+create type testtype5 as (a int);
+select row(1, 2)::testtype1 < row(1)::testtype5;
+select row(1, 2)::testtype1 <> row(1)::testtype5;
+
+-- non-comparable types
+create type testtype6 as (a int, b point);
+select row(1, '(1,2)')::testtype6 < row(1, '(1,3)')::testtype6;
+select row(1, '(1,2)')::testtype6 <> row(1, '(1,3)')::testtype6;
+
+drop type testtype1, testtype3, testtype5, testtype6;
+
+--
+-- Tests for record_image_{eq,cmp}
+--
+
+create type testtype1 as (a int, b int);
+
+-- all true
+select row(1, 2)::testtype1 *< row(1, 3)::testtype1;
+select row(1, 2)::testtype1 *<= row(1, 3)::testtype1;
+select row(1, 2)::testtype1 *= row(1, 2)::testtype1;
+select row(1, 2)::testtype1 *<> row(1, 3)::testtype1;
+select row(1, 3)::testtype1 *>= row(1, 2)::testtype1;
+select row(1, 3)::testtype1 *> row(1, 2)::testtype1;
+
+-- all false
+select row(1, -2)::testtype1 *< row(1, -3)::testtype1;
+select row(1, -2)::testtype1 *<= row(1, -3)::testtype1;
+select row(1, -2)::testtype1 *= row(1, -3)::testtype1;
+select row(1, -2)::testtype1 *<> row(1, -2)::testtype1;
+select row(1, -3)::testtype1 *>= row(1, -2)::testtype1;
+select row(1, -3)::testtype1 *> row(1, -2)::testtype1;
+
+-- This returns the "wrong" order because record_image_cmp works on
+-- unsigned datums without knowing about the actual data type.
+select row(1, -2)::testtype1 *< row(1, 3)::testtype1;
+
+-- other types
+create type testtype2 as (a smallint, b bool);  -- byval different sizes
+select row(1, true)::testtype2 *< row(2, true)::testtype2;
+select row(-2, true)::testtype2 *< row(-1, true)::testtype2;
+select row(0, false)::testtype2 *< row(0, true)::testtype2;
+select row(0, false)::testtype2 *<> row(0, true)::testtype2;
+
+create type testtype3 as (a int, b text);  -- variable length
+select row(1, 'abc')::testtype3 *< row(1, 'abd')::testtype3;
+select row(1, 'abc')::testtype3 *< row(1, 'abcd')::testtype3;
+select row(1, 'abc')::testtype3 *> row(1, 'abd')::testtype3;
+select row(1, 'abc')::testtype3 *<> row(1, 'abd')::testtype3;
+
+create type testtype4 as (a int, b point);  -- by ref, fixed length
+select row(1, '(1,2)')::testtype4 *< row(1, '(1,3)')::testtype4;
+select row(1, '(1,2)')::testtype4 *<> row(1, '(1,3)')::testtype4;
+
+-- mismatches
+select row(1, 2)::testtype1 *< row(1, 'abc')::testtype3;
+select row(1, 2)::testtype1 *<> row(1, 'abc')::testtype3;
+create type testtype5 as (a int);
+select row(1, 2)::testtype1 *< row(1)::testtype5;
+select row(1, 2)::testtype1 *<> row(1)::testtype5;
+
+-- non-comparable types
+create type testtype6 as (a int, b point);
+select row(1, '(1,2)')::testtype6 *< row(1, '(1,3)')::testtype6;
+select row(1, '(1,2)')::testtype6 *>= row(1, '(1,3)')::testtype6;
+select row(1, '(1,2)')::testtype6 *<> row(1, '(1,3)')::testtype6;
+
+drop type testtype1, testtype2, testtype3, testtype4, testtype5, testtype6;
+
 
 --
 -- Test case derived from bug #5716: check multiple uses of a rowtype result
@@ -229,6 +346,26 @@ select text(row('Jim', 'Beam'));  -- error
 select (row('Jim', 'Beam')).text;  -- error
 
 --
+-- Check the equivalence of functional and column notation
+--
+insert into fullname values ('Joe', 'Blow');
+
+select f.last from fullname f;
+select last(f) from fullname f;
+
+create function longname(fullname) returns text language sql
+as $$select $1.first || ' ' || $1.last$$;
+
+select f.longname from fullname f;
+select longname(f) from fullname f;
+
+-- Starting in v11, the notational form does matter if there's ambiguity
+alter table fullname add column longname text;
+
+select f.longname from fullname f;
+select longname(f) from fullname f;
+
+--
 -- Test that composite values are seen to have the correct column names
 -- (bug #11210 and other reports)
 --
@@ -271,3 +408,55 @@ create temp table tt1 as select * from int8_tbl limit 2;
 create temp table tt2 () inherits(tt1);
 insert into tt2 values(0,0);
 select row_to_json(r) from (select q2,q1 from tt1 offset 0) r;
+
+-- check no-op rowtype conversions
+create temp table tt3 () inherits(tt2);
+insert into tt3 values(33,44);
+select row_to_json(tt3::tt2::tt1) from tt3;
+
+--
+-- IS [NOT] NULL should not recurse into nested composites (bug #14235)
+--
+
+explain (verbose, costs off)
+select r, r is null as isnull, r is not null as isnotnull
+from (values (1,row(1,2)), (1,row(null,null)), (1,null),
+             (null,row(1,2)), (null,row(null,null)), (null,null) ) r(a,b);
+
+select r, r is null as isnull, r is not null as isnotnull
+from (values (1,row(1,2)), (1,row(null,null)), (1,null),
+             (null,row(1,2)), (null,row(null,null)), (null,null) ) r(a,b);
+
+explain (verbose, costs off)
+with r(a,b) as
+  (values (1,row(1,2)), (1,row(null,null)), (1,null),
+          (null,row(1,2)), (null,row(null,null)), (null,null) )
+select r, r is null as isnull, r is not null as isnotnull from r;
+
+with r(a,b) as
+  (values (1,row(1,2)), (1,row(null,null)), (1,null),
+          (null,row(1,2)), (null,row(null,null)), (null,null) )
+select r, r is null as isnull, r is not null as isnotnull from r;
+
+
+--
+-- Tests for component access / FieldSelect
+--
+CREATE TABLE compositetable(a text, b text) WITH OIDS;
+INSERT INTO compositetable(a, b) VALUES('fa', 'fb');
+
+-- composite type columns can't directly be accessed (error)
+SELECT d.a FROM (SELECT compositetable AS d FROM compositetable) s;
+-- but can be accessed with proper parens
+SELECT (d).a, (d).b FROM (SELECT compositetable AS d FROM compositetable) s;
+-- oids can't be accessed in composite types (error)
+SELECT (d).oid FROM (SELECT compositetable AS d FROM compositetable) s;
+
+-- accessing non-existing column in NULL datum errors out
+SELECT (NULL::compositetable).nonexistant;
+-- existing column in a NULL composite yield NULL
+SELECT (NULL::compositetable).a;
+-- oids can't be accessed in composite types (error)
+SELECT (NULL::compositetable).oid;
+
+DROP TABLE compositetable;

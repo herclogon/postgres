@@ -23,10 +23,10 @@ CREATE AGGREGATE newsum (
 -- zero-argument aggregate
 CREATE AGGREGATE newcnt (*) (
    sfunc = int8inc, stype = int8,
-   initcond = '0'
+   initcond = '0', parallel = safe
 );
 
--- old-style spelling of same
+-- old-style spelling of same (except without parallel-safe; that's too new)
 CREATE AGGREGATE oldcnt (
    sfunc = int8inc, basetype = 'ANY', stype = int8,
    initcond = '0'
@@ -86,7 +86,8 @@ create aggregate my_percentile_disc(float8 ORDER BY anyelement) (
   stype = internal,
   sfunc = ordered_set_transition,
   finalfunc = percentile_disc_final,
-  finalfunc_extra = true
+  finalfunc_extra = true,
+  finalfunc_modify = read_write
 );
 
 create aggregate my_rank(VARIADIC "any" ORDER BY VARIADIC "any") (
@@ -113,6 +114,72 @@ CREATE AGGREGATE sumdouble (float8)
     mstype = float8,
     msfunc = float8pl,
     minvfunc = float8mi
+);
+
+-- aggregate combine and serialization functions
+
+-- can't specify just one of serialfunc and deserialfunc
+CREATE AGGREGATE myavg (numeric)
+(
+	stype = internal,
+	sfunc = numeric_avg_accum,
+	serialfunc = numeric_avg_serialize
+);
+
+-- serialfunc must have correct parameters
+CREATE AGGREGATE myavg (numeric)
+(
+	stype = internal,
+	sfunc = numeric_avg_accum,
+	serialfunc = numeric_avg_deserialize,
+	deserialfunc = numeric_avg_deserialize
+);
+
+-- deserialfunc must have correct parameters
+CREATE AGGREGATE myavg (numeric)
+(
+	stype = internal,
+	sfunc = numeric_avg_accum,
+	serialfunc = numeric_avg_serialize,
+	deserialfunc = numeric_avg_serialize
+);
+
+-- ensure combine function parameters are checked
+CREATE AGGREGATE myavg (numeric)
+(
+	stype = internal,
+	sfunc = numeric_avg_accum,
+	serialfunc = numeric_avg_serialize,
+	deserialfunc = numeric_avg_deserialize,
+	combinefunc = int4larger
+);
+
+-- ensure create aggregate works.
+CREATE AGGREGATE myavg (numeric)
+(
+	stype = internal,
+	sfunc = numeric_avg_accum,
+	finalfunc = numeric_avg,
+	serialfunc = numeric_avg_serialize,
+	deserialfunc = numeric_avg_deserialize,
+	combinefunc = numeric_avg_combine,
+	finalfunc_modify = shareable  -- just to test a non-default setting
+);
+
+-- Ensure all these functions made it into the catalog
+SELECT aggfnoid, aggtransfn, aggcombinefn, aggtranstype::regtype,
+       aggserialfn, aggdeserialfn, aggfinalmodify
+FROM pg_aggregate
+WHERE aggfnoid = 'myavg'::REGPROC;
+
+DROP AGGREGATE myavg (numeric);
+
+-- invalid: bad parallel-safety marking
+CREATE AGGREGATE mysum (int)
+(
+	stype = int,
+	sfunc = int4pl,
+	parallel = pear
 );
 
 -- invalid: nonstrict inverse with strict forward function
@@ -143,4 +210,24 @@ CREATE AGGREGATE wrongreturntype (float8)
     mstype = float8,
     msfunc = float8pl,
     minvfunc = float8mi_int
+);
+
+-- invalid: non-lowercase quoted identifiers
+
+CREATE AGGREGATE case_agg ( -- old syntax
+	"Sfunc1" = int4pl,
+	"Basetype" = int4,
+	"Stype1" = int4,
+	"Initcond1" = '0',
+	"Parallel" = safe
+);
+
+CREATE AGGREGATE case_agg(float8)
+(
+	"Stype" = internal,
+	"Sfunc" = ordered_set_transition,
+	"Finalfunc" = percentile_disc_final,
+	"Finalfunc_extra" = true,
+	"Finalfunc_modify" = read_write,
+	"Parallel" = safe
 );
